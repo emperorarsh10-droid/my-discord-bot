@@ -50,6 +50,13 @@ _TOKEN_SHAPE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_\-.]+$")
 
 CommandSyncMode = Literal["global", "guild"]
 
+#: When to publish the command tree at startup. ``if_changed`` is the default
+#: because a global sync costs one HTTP request per command against a
+#: heavily-throttled endpoint, and re-issuing it on every process restart
+#: exhausted that budget and restarted Discord's propagation timer - which is
+#: what makes clients show the commands as outdated for up to an hour.
+CommandSyncOnStart = Literal["if_changed", "always", "never"]
+
 
 class ConfigurationError(RuntimeError):
     """Raised when the environment cannot produce a usable configuration."""
@@ -284,6 +291,17 @@ class Settings(BaseSettings):
     dev_guild_id: int | None = Field(
         default=None,
         description="Target guild for instant command propagation in dev mode.",
+    )
+    sync_on_start: CommandSyncOnStart = Field(default="if_changed")
+    data_dir: Path = Field(default=Path("./data"))
+    message_content_intent: bool = Field(
+        default=True,
+        description=(
+            "Request the privileged Message Content gateway intent. Required by "
+            "the AutoMod escalation ladder and sticky-message reposting, which "
+            "both run from on_message listeners. Requires the privileged intent "
+            "to be enabled in the Discord developer portal."
+        ),
     )
 
     # -- Database -----------------------------------------------------------

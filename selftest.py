@@ -230,6 +230,151 @@ def _migration_checks() -> None:
     check("Base metadata still resolves after migration helpers ran", bool(Base.metadata.tables))
 
 
+async def _command_sync_checks(bot) -> None:
+    """The command tree must publish once, not on every process restart.
+
+    A global sync costs one HTTP request per command against an endpoint Discord
+    throttles hard. Re-issuing it on every restart exhausted that budget and
+    reset the propagation timer, so for up to an hour after each deploy every
+    client showed the previous command set and rejected calls as outdated. The
+    fingerprint makes an unchanged tree a no-op.
+    """
+    import tempfile
+    from pathlib import Path as _Path
+
+    from discord import app_commands
+
+    import main as main_module
+
+    tree = bot.tree
+    baseline = main_module._tree_fingerprint(tree)
+    check("fingerprint is deterministic", baseline == main_module._tree_fingerprint(tree), baseline)
+    check("fingerprint is a short hex digest", len(baseline) == 16 and all(
+        ch in "0123456789abcdef" for ch in baseline), baseline)
+
+    # A real change to the published shape must move the digest, and removing it
+    # must restore the original — otherwise the check would pin commands forever.
+    async def _noop(interaction) -> None:  # pragma: no cover - never invoked
+        return
+
+    probe = app_commands.Command(name="zeye_selftest_probe", description="x", callback=_noop)
+    tree.add_command(probe)
+    changed = main_module._tree_fingerprint(tree)
+    check("fingerprint tracks a new command", changed != baseline, f"{baseline} -> {changed}")
+    tree.remove_command("zeye_selftest_probe")
+    check(
+        "fingerprint returns when the command is removed",
+        main_module._tree_fingerprint(tree) == baseline,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        calls: list[int] = []
+
+        async def _fake_sync(*_args, **_kwargs):
+            calls.append(1)
+            return tree.get_commands()
+
+        original_sync = tree.sync
+        original_mode = settings_snapshot().command_sync_mode
+        original_on_start = settings_snapshot().sync_on_start
+        original_data_dir = settings_snapshot().data_dir
+        settings = settings_snapshot()
+        settings.command_sync_mode = "global"
+        settings.data_dir = _Path(tmp)
+        tree.sync = _fake_sync  # type: ignore[method-assign]
+        try:
+            await main_module.sync_commands(bot, settings)
+            check("first boot publishes the tree", len(calls) == 1, f"{len(calls)} call(s)")
+
+            await main_module.sync_commands(bot, settings)
+            check("unchanged tree skips the republish", len(calls) == 1, f"{len(calls)} call(s)")
+
+            tree.add_command(probe)
+            await main_module.sync_commands(bot, settings)
+            check("a changed tree publishes again", len(calls) == 2, f"{len(calls)} call(s)")
+
+            settings.sync_on_start = "always"
+            await main_module.sync_commands(bot, settings)
+            check("sync_on_start=always always publishes", len(calls) == 3, f"{len(calls)} call(s)")
+
+            settings.sync_on_start = "never"
+            await main_module.sync_commands(bot, settings)
+            check("sync_on_start=never never publishes", len(calls) == 3, f"{len(calls)} call(s)")
+        finally:
+            tree.remove_command("zeye_selftest_probe")
+            tree.sync = original_sync  # type: ignore[method-assign]
+            settings.command_sync_mode = original_mode
+            settings.sync_on_start = original_on_start
+            settings.data_dir = original_data_dir
+
+
+def settings_snapshot():
+    """The live Settings singleton, for tests that mutate it in place."""
+    from config import get_settings
+
+    return get_settings()
+
+
+async def _probe_honesty_checks(bot) -> None:
+    """A probe must not report a healthy subsystem as broken.
+
+    The cache probe called ``is_ws_ratelimited()``, which only reports the
+    gateway shard's own reconnect backoff and says nothing about REST. Discord
+    rate-limits a freshly booted bot routinely, so the probe printed "REST bucket
+    is currently rate limited" and failed the subsystem while the cache was warm
+    and every command was working. Operators chased an API problem they did not
+    have.
+    """
+    dev = bot.get_cog("Developer") or bot.get_cog("developer")
+    check("developer cog loaded for probe checks", dev is not None, str(list(bot.cogs)))
+
+    if dev is None:
+        return
+
+    # Offline selftest has no guilds, so the honest verdict here is the
+    # "not in any server" branch — never a rate-limit claim.
+    verdict = await dev._probe_cache()
+    detail = str(verdict.get("detail", ""))
+    check(
+        "cache probe never blames the REST bucket",
+        "REST bucket" not in detail,
+        detail,
+    )
+    check(
+        "cache probe reports the real failure when empty",
+        verdict.get("ok") is False and "not in any server" in detail,
+        detail,
+    )
+
+    # The intent audit must not claim listener-side enforcement works while the
+    # privileged intent is off, which is what let AutoMod escalation and sticky
+    # reposting silently do nothing in production.
+    clean, lines = dev._check_configuration()
+    intent_lines = [line for line in lines if line.startswith(("ok ", "! "))
+                    and "message_content_intent" in line]
+    check("config audit reports the intent", len(intent_lines) == 1, str(lines[-6:]))
+    if intent_lines:
+        line = intent_lines[0]
+        check(
+            "missing message_content intent is flagged, not blessed",
+            (not bot.intents.message_content) == line.startswith("!"),
+            line,
+        )
+
+    # The bot must actually request the intent. AutoMod's escalation ladder and
+    # sticky reposting read message.content from on_message listeners; with the
+    # intent off Discord delivers an empty string and those features are inert
+    # while every slash command still appears to work.
+    from config import get_settings
+
+    check(
+        "message_content intent requested by default",
+        get_settings().message_content_intent is True,
+        str(get_settings().message_content_intent),
+    )
+    check("bot requests the intent", bot.intents.message_content is True)
+
+
 async def main() -> int:
     _purge_selftest_db()
     settings = get_settings()
@@ -908,6 +1053,12 @@ async def main() -> int:
 
     print("\n=== 12c. additive column migration ===")
     _migration_checks()
+
+    print("\n=== 12d. command sync discipline ===")
+    await _command_sync_checks(bot)
+
+    print("\n=== 12e. diagnostic probe honesty ===")
+    await _probe_honesty_checks(bot)
 
     print("\n=== 13. teardown ===")
     await database.disconnect()

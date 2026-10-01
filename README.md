@@ -4,10 +4,14 @@ A production-grade Discord moderation and server-management bot. Every capabilit
 is a **slash command** — there is no web tier, no HTTP listener, and no port to
 expose.
 
-The bot never requests the privileged `message_content` intent, so inviting it
-produces no "sensitive permissions" warning and it cannot read what people type in
-channels it is not explicitly given. Phrase blocking is handed to Discord's own
-AutoMod, which means enforcement works even though the bot reads nothing.
+The bot requests the privileged `message_content` intent, because the AutoMod
+**escalation ladder** and **sticky-message reposting** are enforced from
+`on_message` listeners and read `message.content`. Handing phrase blocking to
+Discord's own AutoMod covers keyword hits, but the warn/kick ladder and stickies
+are bot-side by design, and without the intent they would be silently inert
+while every slash command still appeared to work. Phrase blocking itself is
+still evaluated by Discord, so it keeps working even if the intent is ever
+revoked.
 
 ---
 
@@ -201,10 +205,12 @@ team and every ban would succeed. Bot owners and administrators bypass it.
 single native AutoMod rule named `Zagrosian Eye · blocked phrases`. The table is
 the record of intent; the Discord rule is the enforcement.
 
-This works without the `message_content` intent, because Discord evaluates the
-keyword and blocks the message itself. The bot only hears about it afterwards,
-through `on_automod_action`, where it logs the block and keeps a 50-entry ring for
-`/status`.
+Phrase blocking specifically works without the `message_content` intent, because
+Discord evaluates the keyword and blocks the message itself. The bot only hears
+about it afterwards, through `on_automod_action`, where it logs the block and
+keeps a 50-entry ring for `/status`. The *escalation ladder* layered on top —
+`/automod` warn/kick/timeout rungs, and the per-guild spam-rate window — is
+bot-side and does read message text, which is why the intent is requested.
 
 `/filter action:list` reports whether the rule is **live**, **drifted** (phrases
 saved but missing from the rule — usually because someone deleted it by hand), or

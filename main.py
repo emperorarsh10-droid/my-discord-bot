@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import importlib
 import logging
 import os
@@ -31,6 +32,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Final
 
 import discord
@@ -72,11 +74,22 @@ class ZagrosianBot(commands.Bot):
     """
 
     def __init__(self, settings: Settings) -> None:
-        # message_content is deliberately off: every command in this bot is a
-        # slash command, and not requesting the privileged intent keeps the
-        # invite URL free of a scary "sensitive permissions" warning.
+        # message_content is REQUIRED, not optional. Discord's own AutoMod rules
+        # cover keyword/phrase blocks server-side, but this bot enforces the
+        # *escalation ladder* and the guild's warn/kick policy from an
+        # on_message listener (cogs/manual.py), and reposts sticky messages from
+        # another one (cogs/community.py). All of those read message.content,
+        # which arrives as an empty string when the privileged intent is off —
+        # so with it disabled the bot logged in, every slash command worked, and
+        # the listener-side enforcement silently did nothing at all. That is the
+        # worst kind of failure to debug, so the intent is on by default and
+        # /status says so plainly if the portal has not granted it yet.
+        #
+        # Granting it requires the Message Content privileged intent in the
+        # Discord developer portal. Without it the bot still starts, but the
+        # audit in /test reports the gap rather than claiming health.
         intents = discord.Intents.default()
-        intents.message_content = False
+        intents.message_content = settings.message_content_intent
 
         super().__init__(
             command_prefix=commands.when_mentioned_or(
@@ -230,12 +243,99 @@ async def load_extensions(bot: ZagrosianBot, settings: Settings) -> list[str]:
     return sorted(failures)
 
 
+def _tree_fingerprint(tree: discord.app_commands.CommandTree) -> str:
+    """A stable digest of everything Discord needs to know about the command tree.
+
+    Only the fields that alter the *published* command matter: name, the option
+    shape (name, type, required, choices), and nesting under groups. Handler
+    bodies, cog names and descriptions are deliberately excluded for descriptions
+    - a description is republished when it changes, but it is not worth forcing
+    a global propagation for wording alone.
+
+    The fingerprint exists so a restart can tell "the operator redeployed with
+    new commands" apart from "the process bounced". Those look identical from
+    inside the container but cost wildly different amounts: every global sync is
+    ~88 HTTP calls against a shared, rate-limited budget, and each one restarts
+    Discord's propagation timer for *every* server, which is what makes clients
+    report the bot's commands as outdated.
+    """
+    parts: list[str] = []
+
+    def walk(command: discord.app_commands.AppCommand, prefix: str) -> None:
+        path = f"{prefix}{command.name}"
+        if isinstance(command, discord.app_commands.Group):
+            parts.append(f"G {path}")
+            for child in sorted(command.commands, key=lambda c: c.name):
+                walk(child, f"{path} ")
+            return
+        parts.append(f"C {path}")
+        for option in sorted(getattr(command, "parameters", ()), key=lambda o: o.name):
+            parts.append(
+                f"  o {option.name} {getattr(option, 'type', '?')} "
+                f"req={getattr(option, 'required', False)} "
+                f"choices={sorted(str(c) for c in getattr(option, 'choices', ()) or ())}"
+            )
+
+    for command in sorted(tree.get_commands(), key=lambda c: c.name):
+        walk(command, "")
+
+    digest = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def _load_last_sync(state_dir: Path) -> str | None:
+    """Read the fingerprint of the last successful sync, if there was one."""
+    path = state_dir / "last_sync.fingerprint"
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _record_sync(state_dir: Path, fingerprint: str) -> None:
+    """Remember the fingerprint so the next boot can skip a redundant publish."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    target = state_dir / "last_sync.fingerprint"
+    tmp = state_dir / "last_sync.fingerprint.tmp"
+    tmp.write_text(fingerprint, encoding="utf-8")
+    tmp.replace(target)
+
+
 async def sync_commands(bot: ZagrosianBot, settings: Settings) -> None:
-    """Publish the slash command tree.
+    """Publish the slash command tree, skipping a publish that would change nothing.
 
     Global sync is the production path; a guild sync is available for
     development so changes appear instantly.
+
+    An unchanged tree is not republished. A global sync costs one HTTP request
+    per command, and Discord throttles the command endpoint hard; re-issuing it
+    on every process restart exhausted the shared bucket and reset the
+    propagation timer, so for up to an hour after each deploy clients showed the
+    previous command set and rejected calls as outdated. Persisting the
+    fingerprint turns a routine restart into zero REST calls while still
+    publishing the moment the tree genuinely changes.
+
+    ``SYNC_COMMANDS_ON_START=always`` restores the old eager behaviour for the
+    case where Discord's cache needs nudging by hand; ``/sync`` always
+    publishes on demand regardless.
     """
+    fingerprint = _tree_fingerprint(bot.tree)
+    state_dir = Path(settings.data_dir) if settings.data_dir else Path("data")
+
+    if settings.sync_on_start == "never":
+        logger.info("Command sync skipped (SYNC_COMMANDS_ON_START=never)")
+        return
+
+    if settings.sync_on_start == "if_changed":
+        previous = _load_last_sync(state_dir)
+        if previous == fingerprint:
+            logger.info(
+                "Command tree unchanged since last publish (%s command(s)); "
+                "skipping sync to preserve the REST budget",
+                len(bot.tree.get_commands()),
+            )
+            return
+
     try:
         if settings.syncs_globally:
             synced = await bot.tree.sync()
@@ -244,18 +344,17 @@ async def sync_commands(bot: ZagrosianBot, settings: Settings) -> None:
                 "to propagate them to clients",
                 len(synced),
             )
-            return
-
-        assert settings.dev_guild_id is not None  # guaranteed by config validation
-        guild = bot.get_guild(settings.dev_guild_id)
-        if guild is None:
-            logger.error(
-                "Dev guild %s is not cached yet; commands publish when the bot "
-                "joins it (or on the next restart). Is DEV_GUILD_ID correct?",
-                settings.dev_guild_id,
-            )
-            return
-        await _publish_guild_commands(bot, guild)
+        else:
+            assert settings.dev_guild_id is not None  # guaranteed by config validation
+            guild = bot.get_guild(settings.dev_guild_id)
+            if guild is None:
+                logger.error(
+                    "Dev guild %s is not cached yet; commands publish when the bot "
+                    "joins it (or on the next restart). Is DEV_GUILD_ID correct?",
+                    settings.dev_guild_id,
+                )
+                return
+            synced = await _publish_guild_commands(bot, guild)
     except discord.app_commands.CommandSyncFailure as exc:
         for name, children in exc.failed_commands or []:
             logger.error(
@@ -265,6 +364,14 @@ async def sync_commands(bot: ZagrosianBot, settings: Settings) -> None:
     except discord.HTTPException as exc:
         logger.error("Could not publish the command tree: %s %s", exc.status, exc.text)
         raise
+
+    try:
+        _record_sync(state_dir, fingerprint)
+    except OSError as exc:
+        # Losing the fingerprint only costs one redundant sync next boot, which
+        # is strictly better than refusing to publish because a scratch file
+        # could not be written.
+        logger.warning("Could not record sync fingerprint: %s", exc)
 
 
 async def _publish_guild_commands(bot: ZagrosianBot, guild: discord.Guild) -> int:

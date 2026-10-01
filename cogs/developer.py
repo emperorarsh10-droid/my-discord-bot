@@ -28,6 +28,7 @@ import asyncio
 import platform
 import sys
 import time
+from pathlib import Path
 from typing import Any, Final
 
 import discord
@@ -58,6 +59,21 @@ from core.errors import PermissionDeniedError
 from core.logging_setup import command_context, get_logger
 
 logger = get_logger("zagrosian.cog.developer")
+
+
+async def _note_manual_sync(config, tree) -> None:
+    """Persist the tree fingerprint after an operator-driven ``/sync``.
+
+    Imported lazily from ``main`` because ``main`` loads this cog: a module-level
+    import would be circular. Best-effort - failing to write a scratch file must
+    never turn a successful sync into an error reply.
+    """
+    from main import _record_sync, _tree_fingerprint
+
+    try:
+        _record_sync(Path(config.data_dir), _tree_fingerprint(tree))
+    except (OSError, ImportError) as exc:
+        logger.debug("Could not record fingerprint after /sync: %s", exc)
 
 #: How long ``/test`` waits for a live REST round trip to answer.
 REST_PROBE_TIMEOUT: Final[float] = 5.0
@@ -281,7 +297,6 @@ class Developer(commands.Cog):
         channels = sum(len(guild.channels) for guild in self.bot.guilds)
         elapsed_ms = (time.perf_counter() - started) * 1000
 
-        connected = self.bot.is_ws_ratelimited() is None
         details = (
             f"**{guilds}** guild(s) · **{users}** users · **{channels}** channels · "
             f"read in **{elapsed_ms:.2f} ms**"
@@ -292,12 +307,22 @@ class Developer(commands.Cog):
                 "status": "fail",
                 "detail": f"cache is empty — {details}\nthe bot is not in any server",
             }
-        if not connected:
+
+        # A live gateway session is what "the cache is being filled" actually
+        # means. The previous check called is_ws_ratelimited(), which only reports
+        # the gateway shard's own reconnect backoff - it says nothing about the
+        # REST bucket, and Discord rate-limits a freshly booted bot routinely.
+        # That reported a perfectly healthy cache as "REST bucket is currently
+        # rate limited", which sent operators chasing an API problem they did not
+        # have. Cache warmth is a function of the session being up, so test that.
+        session_alive = self.bot.is_ready() and not self.bot.is_closed()
+        if not session_alive:
             return {
                 "ok": False,
                 "status": "fail",
-                "detail": f"{details}\nREST bucket is currently rate limited",
+                "detail": f"{details}\ngateway session is not established",
             }
+
         return {
             "ok": True,
             "status": "ok",
@@ -324,13 +349,25 @@ class Developer(commands.Cog):
             f"{'ok' if settings.token_is_well_formed else '!'} token_format = "
             f"{'valid shape' if settings.token_is_well_formed else 'unexpected characters'}"
         )
-        intents_ok = not self.bot.intents.message_content
-        intent_note = (
-            "off (automod runs on Discord, not on_message)"
-            if intents_ok
-            else "ON (unnecessary)"
-        )
-        lines.append(f"{'ok' if intents_ok else '!'} message_content_intent = {intent_note}")
+        # The previous version reported "off" as healthy, on the claim that
+        # AutoMod runs on Discord's own rules and never needs message content.
+        # That is only half true: the native rules cover keyword/phrase/spam
+        # blocks, but cogs/manual.py enforces the *ladder* and the guild's
+        # escalation policy from an on_message listener, and
+        # cogs/community.py reposts stickies from one too. Without the intent
+        # message.content arrives empty, so those paths silently do nothing -
+        # and the audit told the operator everything was fine. Report the truth
+        # instead: the listener-side features are inert without it.
+        if self.bot.intents.message_content:
+            lines.append("ok message_content_intent = ON (enforcement + sticky active)")
+        else:
+            lines.append(
+                "! message_content_intent = OFF - native AutoMod rules still apply, "
+                "but AutoMod warn/kick escalation and sticky-message reposting "
+                "cannot see message text and are inert. Enable the privileged "
+                "intent in the Discord portal, then set "
+                "intents.message_content = True in main.py"
+            )
         lines.append(f"ok command_sync_mode = {settings.command_sync_mode}")
         lines.append(f"ok python = {platform.python_version()} ({sys.platform})")
 
@@ -424,6 +461,10 @@ class Developer(commands.Cog):
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
         logger.info("Synced %s command(s) to %s", len(synced), destination)
+        # Record the fingerprint so a manual publish is not immediately undone by
+        # a redundant one on the next restart. Imported here rather than at module
+        # scope: main imports this cog, so a top-level import would be circular.
+        await _note_manual_sync(self.config, self.bot.tree)
 
     # ------------------------------------------------------------------ #
     # /reload

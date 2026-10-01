@@ -11,9 +11,15 @@ its token. Two ways to run it: on a plain box (or Docker-ish host) with
 1. https://discord.com/developers/applications → **New Application**.
 2. **Bot → Add Bot**, then **Reset Token** and copy it. This is
    `DISCORD_BOT_TOKEN`.
-3. **Bot → Privileged Gateway Intents**: nothing here is required. The bot asks
-   only for the `guilds` intent (for guild counts and cache) — it does **not**
-   request `message_content` or `members`. Leave the privileged toggles **off**.
+3. **Bot → Privileged Gateway Intents**: enable **Message Content Intent**.
+   This one is required. Discord's own AutoMod rules run server-side and cover
+   keyword blocks, but this bot enforces the **warn/kick escalation ladder** and
+   reposts **sticky messages** from `on_message` listeners. Both read
+   `message.content`, which Discord delivers as an empty string when the
+   privileged intent is off — the bot would connect, every slash command would
+   work, and those two features would silently do nothing.
+   `message_content` and `members` are the only intents requested; both are off
+   by default in `discord.py`, and `members` stays off (nothing needs it).
 4. **OAuth2 → General**: copy the **Client ID** and **Public Key**.
 5. Invite it with:
 
@@ -82,6 +88,7 @@ redacted, or `/settings` for the per-server view.
 | `DATABASE_TIMEOUT` | `5.0` | Seconds before a round-trip is declared unhealthy |
 | `OWNER_IDS` | *(empty)* | Comma-separated user IDs for `/status`, `/test`, `/sync`, `/reload`. Empty ⇒ the Discord app owner only |
 | `COMMAND_SYNC_MODE` | `global` | `guild` for instant sync while developing (needs `DEV_GUILD_ID`) |
+| `SYNC_COMMANDS_ON_START` | `if_changed` | `if_changed` \| `always` \| `never` — see below |
 | `DEV_GUILD_ID` | *(empty)* | Required when `COMMAND_SYNC_MODE=guild` |
 | `LOG_LEVEL` | `INFO` | |
 | `LOG_DIR` | `./logs` | |
@@ -97,6 +104,26 @@ the host sets it — see §3.3 for the Render keep-alive setup.
 
 A **non-empty** `OWNER_IDS` is recommended even though the app owner falls back
 automatically — it lets more than one operator run the developer commands.
+
+### Commands reporting as "outdated" or timing out
+
+`SYNC_COMMANDS_ON_START` exists because a global sync is expensive. Discord's
+command endpoint is throttled hard, and `tree.sync()` issues **one HTTP request
+per command** — 88 commands means 88 requests. Worse, every one of them resets
+the propagation timer, so for up to an hour after the sync Discord serves
+clients the *previous* command set and rejects calls as outdated.
+
+With `if_changed` the bot hashes the published command shape on boot and skips
+the sync entirely when nothing changed, so an ordinary restart costs zero
+requests and does not disturb the timer. A redeploy that genuinely adds or
+changes a command still publishes automatically.
+
+`/sync` always publishes on demand and updates the stored hash afterwards.
+
+Global sync can still take up to an hour to reach every client. If you need
+instant changes while iterating, set `COMMAND_SYNC_MODE=guild` with
+`DEV_GUILD_ID` — guild-scoped commands propagate immediately. That is a
+development setting; production should stay on `global`.
 
 ---
 
