@@ -1,0 +1,44 @@
+# Lint configuration. Run with:  python -m ruff check .
+target-version = "py314"
+line-length = 100
+extend-exclude = ["data", "logs", ".venv"]
+
+[lint]
+# BLE001 is enabled deliberately: the codebase catches broad exceptions in a
+# few places where continuing is the correct behaviour (a log handler must never
+# raise, a moderator action must never take the bot down). Those sites are
+# marked with an explicit `# noqa: BLE001` and a comment explaining why.
+select = [
+    "E", "F", "W", "I", "UP", "B", "SIM", "RUF",
+    "BLE", "C4", "PIE", "RET", "S", "ASYNC", "TID", "DTZ", "LOG", "G",
+]
+ignore = [
+    # argparse-style CLIs and command handlers legitimately shadow builtins.
+    "A002",
+    # `logging.getLogger(__name__)` per module is the documented pattern.
+    "RUF012",
+    # Binding every interface is a deployment concern, not a code decision.
+    "S104",
+    # Asserts here are `isinstance`/`is not None` narrowing the type checker
+    # cannot infer; the runtime guard is always checked immediately before.
+    "S101",
+]
+
+[lint.per-file-ignores]
+# The self-test imports after setting os.environ on purpose, catches broad
+# exceptions to record a failure, and uses a fake token. Wrapping its long
+# generated reprs would hurt readability more than the column limit helps.
+"selftest.py" = [
+    "E402", "E501", "F401", "F841", "B007", "RUF059",
+    "BLE001", "S105", "S106", "S310",
+]
+# `__slots__` order mirrors the attribute lifecycle, not alphabetical order.
+"**/__init__.py" = ["F401"]
+
+[lint.isort]
+known-first-party = ["config", "core", "cogs", "main"]
+combine-as-imports = true
+
+[format]
+quote-style = "double"
+indent-style = "space"

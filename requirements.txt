@@ -1,0 +1,20 @@
+# The Zagrosian Eye — runtime dependencies (pinned for reproducible installs)
+# Install:  python -m pip install -r requirements.txt
+
+# --- Discord layer ---------------------------------------------------------
+discord.py==2.3.2
+# Required on Python >= 3.13: the stdlib `audioop` module was removed in 3.13,
+# but discord.py's voice_client imports it unconditionally at package import.
+# Without this, `import discord` fails before the bot ever starts.
+audioop-lts==0.2.2; python_version >= "3.13"
+
+# --- Configuration ---------------------------------------------------------
+pydantic==2.13.4
+pydantic-settings==2.15.0
+python-dotenv==1.0.0
+
+# --- Persistence -----------------------------------------------------------
+SQLAlchemy[asyncio]==2.1.1
+aiosqlite==0.22.1             # sqlite driver (development / small deployments)
+asyncpg==0.31.0              # postgresql driver (production)
+greenlet==3.5.6              # required by SQLAlchemy async bridge

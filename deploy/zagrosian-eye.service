@@ -1,0 +1,40 @@
+[Unit]
+Description=The Zagrosian Eye (Discord moderation bot)
+Documentation=https://github.com/your-org/zagrosian-eye
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zeye
+Group=zeye
+WorkingDirectory=/opt/zagrosian-eye
+EnvironmentFile=/opt/zagrosian-eye/.env
+ExecStart=/opt/zagrosian-eye/.venv/bin/python main.py
+
+Restart=always
+RestartSec=15
+# A crash loop that never recovers should stop retrying rather than spin forever.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Give the gateway socket time to reconnect cleanly on SIGTERM.
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zagrosian-eye
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/zagrosian-eye/data /opt/zagrosian-eye/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

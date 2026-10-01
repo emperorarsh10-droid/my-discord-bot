@@ -1,0 +1,42 @@
+services:
+  # This is a free WEB SERVICE, not a Background Worker.
+  #
+  # Render's free tier covers web services only (background workers start at
+  # $7/mo). A Discord bot is a long-running gateway client with no inbound
+  # traffic, so on its own Render would suspend it ~15 minutes after boot.
+  # The health server in core/health_server.py binds $PORT, and an external
+  # monitor (UptimeRobot) pings it every 5 minutes — that inbound request is
+  # what keeps the instance awake. See DEPLOY.md §3.3.
+  - type: web
+    name: zagrosian-eye
+    runtime: python
+    plan: free
+    region: oregon
+
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    # No gunicorn/uvicorn wrapper: main.py runs the gateway and the health
+    # server on one event loop, so the Python process IS the service.
+    startCommand: python main.py
+
+    healthCheckPath: /health
+    # Render polls this itself; the external monitor covers the sleep timer.
+    autoDeploy: true
+
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: COMMAND_SYNC_MODE
+        value: global
+      - key: DATABASE_URL
+        # Render's free tier has an EPHEMERAL disk: leaving this as the SQLite
+        # default means data/zagrosian_eye.db is wiped on every deploy.
+        # Either attach a Disk and use sqlite+aiosqlite:////data/zagrosian_eye.db
+        # (four slashes = absolute), or point this at a free Postgres such as
+        # Neon. Never commit a real token here.
+        sync: false
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: OWNER_IDS
+        sync: false
+      - key: DEV_GUILD_ID
+        sync: false
