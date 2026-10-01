@@ -9,6 +9,7 @@ and the config checklist that ``/status`` renders.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import socket
@@ -93,6 +94,19 @@ async def main() -> int:
     check("DISCORD_BOT_TOKEN accepts the DISCORD_TOKEN alias",
           "DISCORD_TOKEN" in _alias_choices("discord_bot_token"),
           str(_alias_choices("discord_bot_token")))
+    # Railway's dashboard templates and Discord bot tutorials both use BOT_TOKEN,
+    # and a bot deployed under it used to die at startup with a message naming
+    # only DISCORD_BOT_TOKEN.
+    check("DISCORD_BOT_TOKEN accepts the BOT_TOKEN alias",
+          "BOT_TOKEN" in _alias_choices("discord_bot_token"),
+          str(_alias_choices("discord_bot_token")))
+    check("DISCORD_BOT_TOKEN remains the highest-precedence alias",
+          _alias_choices("discord_bot_token")[0] == "DISCORD_BOT_TOKEN",
+          str(_alias_choices("discord_bot_token")))
+    # A bare TOKEN could collide with an unrelated secret, so it must stay out.
+    check("a bare TOKEN is not accepted",
+          "TOKEN" not in _alias_choices("discord_bot_token"),
+          str(_alias_choices("discord_bot_token")))
     check("log_buffer accepts the legacy DASHBOARD_LOG_BUFFER alias",
           "DASHBOARD_LOG_BUFFER" in _alias_choices("log_buffer"),
           str(_alias_choices("log_buffer")))
@@ -107,6 +121,8 @@ async def main() -> int:
         os.environ.pop("DASHBOARD_LOG_BUFFER", None)
         if _saved_legacy is not None:
             os.environ["DASHBOARD_LOG_BUFFER"] = _saved_legacy
+
+    _token_resolution_checks()
 
     # Every removed web key must be inert, not a crash.
     dead = {"dashboard_enabled", "dashboard_host", "dashboard_port", "dashboard_public",
@@ -604,6 +620,99 @@ async def main() -> int:
 
     print(f"\n{'='*60}\n  {PASS} passed, {FAIL} failed\n{'='*60}")
     return 1 if FAIL else 0
+
+
+def _token_resolution_checks() -> None:
+    """The bot token must resolve from any spelling a PaaS dashboard might use.
+
+    Railway deployments crashed at startup with "DISCORD_BOT_TOKEN is not set"
+    while a token was present in the environment under a different key. Two
+    separate causes are covered here:
+
+    1. An unrecognised key (``BOT_TOKEN``) — the fallback simply had to be
+       accepted as an alias.
+    2. An *empty* primary key shadowing a good fallback. ``AliasChoices`` stops
+       at the first key that exists, even when its value is ``""``, which is
+       what a cleared dashboard secret or a committed ``DISCORD_BOT_TOKEN=``
+       line produces. A non-empty candidate must win instead.
+    """
+    from config import DISCORD_TOKEN_ENV_NAMES, ConfigurationError
+
+    token = "MTIzNDU2Nzg5MDEyMzQ1Njc4.GaBcDe.fF0oBarBazQux0123456789abc"
+    _extra = ("TOKEN", "DISCORD_SECRET", "discord_token", "bot_token", "discord_bot_token")
+
+    @contextlib.contextmanager
+    def _cleared_token_env():
+        """Hide every candidate token key for the duration of the block."""
+        saved = {
+            name: os.environ.pop(name, None)
+            for name in (*DISCORD_TOKEN_ENV_NAMES, *_extra)
+        }
+        try:
+            yield
+        finally:
+            for name, value in saved.items():
+                os.environ.pop(name, None)
+                if value is not None:
+                    os.environ[name] = value
+
+    def resolve(env: dict[str, str], init: str | None = None) -> str:
+        with _cleared_token_env():
+            os.environ.update(env)
+            try:
+                kwargs: dict[str, Any] = {"_env_file": None}
+                if init is not None:
+                    kwargs["discord_bot_token"] = init
+                return _Settings(**kwargs).bot_token
+            except ConfigurationError:
+                return "<raises>"
+
+    for name in DISCORD_TOKEN_ENV_NAMES:
+        check(f"token resolves from {name}", resolve({name: token}) == token)
+
+    # Lowercase keys, since case_sensitive=False.
+    check("token resolves from lowercase discord_token",
+          resolve({"discord_token": token}) == token)
+
+    check("DISCORD_BOT_TOKEN wins when both are set",
+          resolve({"DISCORD_BOT_TOKEN": "primary", "DISCORD_TOKEN": "secondary"}) == "primary")
+
+    # The AliasChoices bug: an empty primary shadows a usable fallback.
+    check("empty DISCORD_BOT_TOKEN falls back to DISCORD_TOKEN",
+          resolve({"DISCORD_BOT_TOKEN": "", "DISCORD_TOKEN": token}) == token)
+    check("empty DISCORD_BOT_TOKEN falls back to BOT_TOKEN",
+          resolve({"DISCORD_BOT_TOKEN": "", "BOT_TOKEN": token}) == token)
+    check("whitespace-only DISCORD_BOT_TOKEN falls back",
+          resolve({"DISCORD_BOT_TOKEN": "   ", "DISCORD_TOKEN": token}) == token)
+    check("first non-empty candidate wins",
+          resolve({"DISCORD_BOT_TOKEN": "", "DISCORD_TOKEN": "aa", "BOT_TOKEN": "bb"}) == "aa")
+
+    check("no token at all raises", resolve({}) == "<raises>")
+    # Generic names must stay rejected, or an unrelated host secret could be
+    # used as a Discord credential without anybody noticing.
+    check("a bare TOKEN is not accepted as the bot token", resolve({"TOKEN": token}) == "<raises>")
+    check("DISCORD_SECRET is not accepted as the bot token",
+          resolve({"DISCORD_SECRET": token}) == "<raises>")
+
+    # An explicit constructor argument outranks the environment.
+    check("explicit token beats the environment",
+          resolve({"DISCORD_BOT_TOKEN": "from-env"}, "explicit") == "explicit")
+    check("empty explicit token still yields the environment value",
+          resolve({"DISCORD_BOT_TOKEN": "from-env"}, "") == "from-env")
+
+    # The error message must name the alternatives, since a naming mistake on a
+    # dashboard is the overwhelmingly likely cause.
+    # Force the "nothing set" state, since the rest of the suite may have left
+    # a token in the environment.
+    try:
+        with _cleared_token_env():
+            missing_token = _Settings(_env_file=None).bot_token
+    except ConfigurationError as exc:
+        message = str(exc)
+    else:
+        message = f"<no error, token was {missing_token!r}>"
+    check("the error names every accepted variable",
+          all(name in message for name in DISCORD_TOKEN_ENV_NAMES), message)
 
 
 def _sqlite_dsn_checks() -> None:

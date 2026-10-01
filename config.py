@@ -61,6 +61,15 @@ class ConfigurationError(RuntimeError):
 #: POSIX hosts. Windows' native ``C:\\...`` form is already unambiguous.
 _PREFIX_WITH_DOUBLE_SLASH: Final[bool] = os.name == "posix"
 
+#: Environment variable names accepted for the Discord bot token, in precedence
+#: order. Shared with :attr:`Settings.bot_token`'s error message so the two can
+#: never drift apart, and referenced by the selftest suite as the contract.
+DISCORD_TOKEN_ENV_NAMES: Final[tuple[str, ...]] = (
+    "DISCORD_BOT_TOKEN",
+    "DISCORD_TOKEN",
+    "BOT_TOKEN",
+)
+
 
 def _is_absolute_sqlite_target(path_part: str) -> bool:
     """True when a SQLite DSN target names an absolute filesystem location.
@@ -192,9 +201,24 @@ class Settings(BaseSettings):
     # -- Discord ------------------------------------------------------------
     discord_bot_token: SecretStr = Field(
         default=SecretStr(""),
-        # ``DISCORD_TOKEN`` is the shorter name many hosting dashboards default
-        # to; both resolve to the same field.
-        validation_alias=AliasChoices("DISCORD_BOT_TOKEN", "DISCORD_TOKEN"),
+        # PaaS dashboards each invent their own name for a secret, and a bot
+        # deployed under one of the wrong ones fails at the gateway handshake
+        # with a message that points nowhere near the real mistake. Rather than
+        # guessing one name, accept every spelling seen in the wild — in this
+        # order, first non-empty wins:
+        #
+        #   DISCORD_BOT_TOKEN  the documented name, and the one .env.example uses
+        #   DISCORD_TOKEN      Railway's "bot token" template default
+        #   BOT_TOKEN          common in Discord bot tutorials
+        #
+        # See DISCORD_TOKEN_ENV_NAMES for the authoritative list.
+        #
+        # Deliberately omitted: a bare TOKEN or DISCORD_SECRET. Those names are
+        # generic enough to collide with an unrelated secret on a shared host,
+        # and silently connecting with the wrong credential is worse than
+        # failing loudly. Case-insensitivity comes from ``case_sensitive=False``,
+        # so lowercase ``discord_token`` resolves as well.
+        validation_alias=AliasChoices(*DISCORD_TOKEN_ENV_NAMES),
         description="Bot token issued by the Discord developer portal.",
     )
     owner_ids: set[int] = Field(
@@ -239,6 +263,57 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Validation
     # ------------------------------------------------------------------ #
+    @model_validator(mode="before")
+    @classmethod
+    def _prefer_non_empty_token(cls, data: Any) -> Any:
+        """Let the first *non-empty* candidate win, not merely the first match.
+
+        ``AliasChoices`` stops at the first key that exists, even when its value
+        is an empty string — and an empty value is exactly what a PaaS dashboard
+        leaves behind after a secret is cleared, or what ``DISCORD_BOT_TOKEN=``
+        in a committed ``.env`` produces. In that situation the empty primary
+        silently shadows a perfectly good ``DISCORD_TOKEN`` and the bot dies at
+        startup claiming no token was found, which is a confusing way to learn
+        that a fallback was needed at all.
+
+        Two details of ``mode="before"`` on a ``BaseSettings`` model drive the
+        implementation. The mapping is keyed by *alias*, not field name — the
+        alias shadows the field name entirely because ``populate_by_name`` is
+        off, so writing ``discord_bot_token`` here is silently ignored. And
+        ``AliasChoices`` has already stopped at the first key that existed, so
+        the fallback values are absent from the mapping altogether. Hence
+        ``os.environ`` is scanned directly, and the winner is written back under
+        the primary alias.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        def _text(value: Any) -> str:
+            if isinstance(value, SecretStr):
+                return value.get_secret_value().strip()
+            return value.strip() if isinstance(value, str) else ""
+
+        # An explicit non-empty constructor value outranks everything below.
+        for key in ("discord_bot_token", *DISCORD_TOKEN_ENV_NAMES):
+            if key in data and _text(data[key]):
+                return data
+
+        chosen = next(
+            (
+                os.environ[name].strip()
+                for name in DISCORD_TOKEN_ENV_NAMES
+                if (os.environ.get(name) or "").strip()
+            ),
+            "",
+        )
+        if not chosen:
+            return data
+
+        data = dict(data)
+        # Keyed by alias on purpose; see the docstring above.
+        data[DISCORD_TOKEN_ENV_NAMES[0]] = SecretStr(chosen)
+        return data
+
     @field_validator("discord_bot_token", mode="after")
     @classmethod
     def _strip_token(cls, value: SecretStr) -> SecretStr:
@@ -377,11 +452,22 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     @property
     def bot_token(self) -> str:
-        """The raw token. Raises rather than handing back an empty string."""
+        """The raw token. Raises rather than handing back an empty string.
+
+        The message lists every accepted variable name, because "token is not
+        set" on a PaaS dashboard is nearly always a *naming* problem: the secret
+        exists under a key the bot does not read. Naming the alternatives turns
+        a startup crash into a one-glance fix.
+        """
         token = self.discord_bot_token.get_secret_value()
         if not token:
+            accepted = ", ".join(DISCORD_TOKEN_ENV_NAMES)
             raise ConfigurationError(
-                "DISCORD_BOT_TOKEN is not set. Copy .env.example to .env and fill it in."
+                f"No Discord bot token found. Set one of: {accepted}. "
+                f"Checked {len(DISCORD_TOKEN_ENV_NAMES)} name(s) in the process "
+                "environment and .env. If you already set a secret on your host "
+                "dashboard, check its key spelling — a token stored under a name "
+                "outside this list is invisible here."
             )
         return token
 
