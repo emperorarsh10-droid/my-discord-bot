@@ -639,7 +639,8 @@ def _token_resolution_checks() -> None:
     from config import DISCORD_TOKEN_ENV_NAMES, ConfigurationError
 
     token = "MTIzNDU2Nzg5MDEyMzQ1Njc4.GaBcDe.fF0oBarBazQux0123456789abc"
-    _extra = ("TOKEN", "DISCORD_SECRET", "discord_token", "bot_token", "discord_bot_token")
+    _extra = ("TOKEN", "DISCORD_SECRET", "discord_token", "bot_token", "discord_bot_token",
+              "ORPHAN_TOKEN")
 
     @contextlib.contextmanager
     def _cleared_token_env():
@@ -699,6 +700,26 @@ def _token_resolution_checks() -> None:
           resolve({"DISCORD_BOT_TOKEN": "from-env"}, "explicit") == "explicit")
     check("empty explicit token still yields the environment value",
           resolve({"DISCORD_BOT_TOKEN": "from-env"}, "") == "from-env")
+
+    # The diagnostic must distinguish "never supplied" from "supplied under a
+    # name we ignore" — otherwise a container that exits 4 on every restart
+    # leaves nothing to act on.
+    from config import _missing_token_message
+
+    with _cleared_token_env():
+        blank = _missing_token_message()
+        check("the diagnostic says the token was never supplied",
+              "never supplied" in blank, blank)
+
+        os.environ["ORPHAN_TOKEN"] = token
+        overlooked = _missing_token_message()
+        check("the diagnostic names an ignored token-like variable",
+              "ORPHAN_TOKEN" in overlooked, overlooked)
+        check("the diagnostic suggests the canonical name",
+              "rename it to" in overlooked, overlooked)
+        # A value must never reach a log line, only the name.
+        check("no secret value appears in the diagnostic",
+              token[:20] not in overlooked, overlooked)
 
     # The error message must name the alternatives, since a naming mistake on a
     # dashboard is the overwhelmingly likely cause.

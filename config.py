@@ -71,6 +71,61 @@ DISCORD_TOKEN_ENV_NAMES: Final[tuple[str, ...]] = (
 )
 
 
+#: Substrings that suggest a variable is meant to hold the bot token, used only
+#: to build the "token is not set" diagnostic. Matching is on the *name* alone,
+#: and no value is ever read, printed or logged.
+_TOKEN_NAME_HINTS: Final[tuple[str, ...]] = ("TOKEN", "SECRET", "DISCORD", "BOT")
+
+
+def _suspicious_token_var_names() -> list[str]:
+    """Environment variable names that look like a token holder but were ignored.
+
+    When the bot refuses to start, the single most useful fact is whether the
+    token arrived at all. Without this, "no token found" is indistinguishable
+    from "token present under a name nobody guessed" — and a container that
+    exits 4 on every restart gives no room to experiment.
+
+    Only names are returned. Values are never inspected, so this cannot leak a
+    credential into a log line, and a host full of unrelated secrets produces a
+    short list rather than a dump.
+    """
+    accepted = {name.upper() for name in DISCORD_TOKEN_ENV_NAMES}
+    return sorted(
+        name
+        for name in os.environ
+        if name.upper() not in accepted
+        and any(hint in name.upper() for hint in _TOKEN_NAME_HINTS)
+    )
+
+
+def _missing_token_message() -> str:
+    """Explain precisely which token variables were looked for, and what was seen."""
+    accepted = ", ".join(DISCORD_TOKEN_ENV_NAMES)
+    message = (
+        f"No Discord bot token found. Set one of: {accepted}. "
+        f"Checked {len(DISCORD_TOKEN_ENV_NAMES)} name(s) in the process environment "
+        "and .env."
+    )
+
+    overlooked = _suspicious_token_var_names()
+    if overlooked:
+        shown = ", ".join(overlooked[:6])
+        more = f" (+{len(overlooked) - 6} more)" if len(overlooked) > 6 else ""
+        message += (
+            f" These look token-related but were NOT read: {shown}{more}. "
+            "If one of them holds the bot token, rename it to "
+            f"{DISCORD_TOKEN_ENV_NAMES[0]}."
+        )
+    else:
+        message += (
+            " No token-like variable is present in the environment at all, so the "
+            "value was never supplied — add it on your host's dashboard. Note that "
+            "variables added to a different service, environment or redeploy group "
+            "are not inherited by this one."
+        )
+    return message
+
+
 def _is_absolute_sqlite_target(path_part: str) -> bool:
     """True when a SQLite DSN target names an absolute filesystem location.
 
@@ -461,14 +516,7 @@ class Settings(BaseSettings):
         """
         token = self.discord_bot_token.get_secret_value()
         if not token:
-            accepted = ", ".join(DISCORD_TOKEN_ENV_NAMES)
-            raise ConfigurationError(
-                f"No Discord bot token found. Set one of: {accepted}. "
-                f"Checked {len(DISCORD_TOKEN_ENV_NAMES)} name(s) in the process "
-                "environment and .env. If you already set a secret on your host "
-                "dashboard, check its key spelling — a token stored under a name "
-                "outside this list is invisible here."
-            )
+            raise ConfigurationError(_missing_token_message())
         return token
 
     @property
