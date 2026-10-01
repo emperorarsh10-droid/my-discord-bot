@@ -13,7 +13,7 @@ import json
 import os
 import socket
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -29,7 +29,7 @@ os.environ.setdefault("COMMAND_SYNC_MODE", "global")
 import discord
 from discord import AppCommandOptionType as T
 
-from config import get_settings
+from config import Settings as _Settings, get_settings
 from core.dashboard_state import runtime_state
 from core.database import get_database
 from core.errors import ZagrosError
@@ -86,8 +86,6 @@ async def main() -> int:
 
     # Env aliases: PaaS hosts often store the token as DISCORD_TOKEN, and the
     # old DASHBOARD_LOG_BUFFER key must still feed the /status log ring.
-    from config import Settings as _Settings
-
     def _alias_choices(field_name: str) -> tuple[str, ...]:
         alias = _Settings.model_fields[field_name].validation_alias
         return tuple(getattr(alias, "choices", (alias,)))
@@ -592,6 +590,9 @@ async def main() -> int:
 
     check("filter CRUD round trip", await _filter_crud_roundtrip(database))
 
+    print("\n=== 12a. SQLite DSN portability ===")
+    _sqlite_dsn_checks()
+
     print("\n=== 12b. health server (Render keep-alive) ===")
     await _health_server_checks()
 
@@ -603,6 +604,101 @@ async def main() -> int:
 
     print(f"\n{'='*60}\n  {PASS} passed, {FAIL} failed\n{'='*60}")
     return 1 if FAIL else 0
+
+
+def _sqlite_dsn_checks() -> None:
+    """Prove no SQLite DSN can resolve to a filesystem-root parent.
+
+    Regression guard for a production crash on Linux hosts: a three-slash DSN
+    such as ``sqlite+aiosqlite:///data/zagrosian_eye.db`` parses as an *absolute*
+    path on Linux, so creating its parent directory raised
+    ``PermissionError: [Errno 13] '/data'``. The identical string is merely
+    relative on Windows, which is why it passed every desktop test.
+
+    Absolute-path detection is asserted with :class:`PurePosixPath` on purpose:
+    the native ``Path`` would answer "is this absolute?" differently per
+    platform and re-open the very bug being guarded.
+    """
+    from config import _is_absolute_sqlite_target
+
+    def remainder_of(url: str) -> str:
+        return url.partition("://")[2]
+
+    def sqlite_opens(url: str) -> PurePosixPath:
+        rem = remainder_of(url)
+        lead = len(rem) - len(rem.lstrip("/"))
+        tail = rem.split("?", 1)[0].lstrip("/")
+        return PurePosixPath("/" + tail) if lead >= 2 else PurePosixPath(tail)
+
+    def _settings_for(dsn: str) -> Any:
+        return _Settings(
+            _env_file=None,
+            discord_bot_token="MTIzNDU2Nzg5MDEyMzQ1Njc4.GaBcDe.fF0oBarBazQux0123456789abc",
+            database_url=dsn,
+        )
+
+    relative_spellings = [
+        "sqlite:///./data/zagrosian_eye.db",
+        "sqlite:///data/zagrosian_eye.db",
+        "sqlite+aiosqlite:///data/zagrosian_eye.db",
+        "sqlite+aiosqlite:///./data/zagrosian_eye.db",
+        "sqlite:///data/deep/nested/zagrosian_eye.db",
+    ]
+    for dsn in relative_spellings:
+        resolved = _settings_for(dsn).database_url
+        opened = sqlite_opens(resolved)
+        check(
+            f"{dsn} stays out of the filesystem root",
+            str(opened.parent) != "/",
+            str(opened),
+        )
+
+    check(
+        "every relative spelling lands on the same database file",
+        len({sqlite_opens(_settings_for(d).database_url).name for d in relative_spellings}) == 1,
+    )
+
+    # The async spelling is the one that used to bypass normalization entirely,
+    # because only the bare "sqlite" scheme was rewritten.
+    check(
+        "sqlite+aiosqlite is normalized, not passed through",
+        _settings_for("sqlite+aiosqlite:///data/x.db").database_url.startswith(
+            "sqlite+aiosqlite:///"
+        ),
+    )
+
+    # :memory: is a sentinel, not a filename. Rewriting it produces a real file
+    # literally named ":memory:", which silently discards the database.
+    for dsn in ("sqlite:///:memory:", "sqlite+aiosqlite:///:memory:"):
+        resolved = _settings_for(dsn).database_url
+        check(
+            f"{dsn} keeps the in-memory sentinel",
+            sqlite_opens(resolved).name == ":memory:",
+            resolved,
+        )
+
+    # An operator who writes four slashes means an absolute path; honouring it
+    # matters because silently relocating a database loses the existing ledger.
+    for dsn in ("sqlite:////opt/app/data/prod.db", "sqlite+aiosqlite:////opt/app/data/prod.db"):
+        check(f"{dsn} is left verbatim", _settings_for(dsn).database_url.endswith(
+            "////opt/app/data/prod.db"
+        ), _settings_for(dsn).database_url)
+
+    check("a 3-slash remainder is relative", not _is_absolute_sqlite_target("/data/x.db"))
+    check("a 4-slash remainder is absolute", _is_absolute_sqlite_target("//data/x.db"))
+    check("a Windows drive path is absolute", _is_absolute_sqlite_target("C:/data/x.db"))
+    check("an empty target is not absolute", not _is_absolute_sqlite_target(""))
+
+    # Postgres DSNs must be untouched by any of this.
+    pg = _settings_for("postgres://user:pass@host:5432/db").database_url
+    check("postgres DSN untouched", pg == "postgresql+asyncpg://user:pass@host:5432/db", pg)
+    # A query string must survive path normalization.
+    check(
+        "sqlite query string preserved",
+        _settings_for("sqlite+aiosqlite:///./data/x.db?timeout=5").database_url.endswith(
+            "?timeout=5"
+        ),
+    )
 
 
 async def _health_server_checks() -> None:

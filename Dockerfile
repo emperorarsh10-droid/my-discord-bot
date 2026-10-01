@@ -29,8 +29,11 @@ RUN useradd --create-home --uid 10001 bot \
     && chown -R bot:bot /app
 USER bot
 
-# No EXPOSE and no HEALTHCHECK: this process holds an outbound gateway socket and
-# opens no listening port, so there is nothing to probe. Liveness is the
-# supervisor's job (systemd Restart=always, or the host's own restart policy).
+# No EXPOSE and no HEALTHCHECK: the bot's gateway socket is outbound. The
+# optional health server (core/health_server.py) binds $PORT when the host sets
+# it, which is how a Render free web service is kept alive by an external
+# monitor — see DEPLOY.md §3.3. Nothing here needs a port for liveness, so
+# container/orchestrator health checks have nothing to probe; process restarts
+# are the supervisor's job.
 
 CMD ["python", "main.py"]

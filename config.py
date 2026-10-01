@@ -55,6 +55,123 @@ class ConfigurationError(RuntimeError):
     """Raised when the environment cannot produce a usable configuration."""
 
 
+#: SQLite spells an absolute path with four slashes — a POSIX convention. On
+#: Windows the same prefix would make the DSN a UNC network reference
+#: (``\\\\host\\share``), which resolves to nothing, so it is only applied on
+#: POSIX hosts. Windows' native ``C:\\...`` form is already unambiguous.
+_PREFIX_WITH_DOUBLE_SLASH: Final[bool] = os.name == "posix"
+
+
+def _is_absolute_sqlite_target(path_part: str) -> bool:
+    """True when a SQLite DSN target names an absolute filesystem location.
+
+    Judged purely by DSN grammar, never by the host OS. The SQLite dialect spells
+    an absolute path with **two or more** leading slashes in the remainder — the
+    first belongs to the ``://`` separator:
+
+    ====================  ==================  ==========
+    DSN                    remainder            meaning
+    ====================  ==================  ==========
+    ``sqlite:///x.db``     ``/x.db``           relative
+    ``sqlite:////x.db``    ``//x.db``          absolute
+    ====================  ==================  ==========
+
+    Using the native :class:`~pathlib.Path` here would make the answer depend on
+    the platform: ``Path("/data")`` is absolute on Linux but relative on Windows,
+    so a check written that way passes on a desktop and raises
+    ``PermissionError: [Errno 13]`` in production. Counting slashes is a property
+    of the DSN string, so it gives the same answer everywhere.
+
+    A Windows-style ``C:/...`` target is absolute on every platform and is
+    detected explicitly.
+    """
+
+    if not path_part:
+        return False
+    if re.match(r"^[A-Za-z]:[\\/]", path_part):
+        return True
+    return len(path_part) - len(path_part.lstrip("/")) >= 2
+
+
+def _encode_sqlite_absolute(path: Path) -> str:
+    """Spell an absolute filesystem path the way *this* host's driver expects.
+
+    SQLAlchemy reads the text after ``://`` as ``[host][/database]``, so the
+    encoding of an absolute path is genuinely platform-specific. Verified
+    against the installed SQLAlchemy 2.x + aiosqlite:
+
+    ==========  ==============================  ==========================
+    Host        Absolute POSIX path             Windows drive path
+    ==========  ==============================  ==========================
+    POSIX       ``sqlite:////srv/app.db``       n/a
+    Windows     n/a                             ``sqlite:///C:/app.db``
+    ==========  ==============================  ==========================
+
+    The Windows row is the non-obvious one. The documented four-slash form
+    (``////C:/app.db``) fails with ``unable to open database file``, while the
+    three-slash form works because SQLAlchemy parses ``C:`` as the *host* and
+    keeps ``/C:/app.db`` as the database, which the driver opens natively.
+    Emitting ``////C:/...`` on Windows instead yields a UNC path
+    (``\\\\C:\\app.db``), which is why this is not simply POSIX everywhere.
+    """
+    text = path.as_posix()
+    if _PREFIX_WITH_DOUBLE_SLASH:
+        return f"//{text}"
+    # Windows still needs exactly one leading slash, so the finished DSN reads
+    # "sqlite:///C:/app.db". Dropping it yields "sqlite://C:/app.db", where
+    # SQLAlchemy parses "C:" as the host and raises
+    # ValueError: invalid literal for int() with base 10: ''
+    return f"/{text}"
+
+
+def _normalize_sqlite_target(remainder: str) -> str:
+    """Return the path portion of a SQLite DSN, anchored to the project root.
+
+    SQLite DSNs are ambiguous by design, and getting this wrong fails in a way
+    that looks unrelated to configuration:
+
+    ``sqlite:///rel.db``      relative path
+    ``sqlite:////abs.db``     absolute path (four slashes)
+
+    A *three*-slash DSN whose remainder begins with ``/`` — e.g.
+    ``sqlite+aiosqlite:///data/zagrosian_eye.db`` — parses as an **absolute**
+    path on Linux, so ``Path(...).parent`` is ``/data`` and creating it raises
+    ``PermissionError: [Errno 13]``. The same string is merely "relative" on
+    Windows, which is why this reproduces on a Linux host and not on a desktop.
+
+    So every relative target is resolved against ``PROJECT_ROOT`` and re-emitted
+    as an unambiguous absolute path for the running platform. A target the
+    operator clearly meant as absolute is left verbatim: relocating somebody's
+    database because their DSN looked odd is worse than honouring it.
+
+    ``:memory:`` is a sentinel rather than a filename, and the slash-stripping
+    below would otherwise turn it into a file literally called ``:memory:``.
+    """
+
+    path_part, separator, query = remainder.partition("?")
+
+    # A remainder carrying two or more leading slashes is the four-slash
+    # absolute form the operator typed deliberately, so it is honoured exactly.
+    # Silently relocating it would point the bot at an empty database.
+    if _is_absolute_sqlite_target(path_part):
+        return remainder
+
+    # Compare after stripping slashes: SQLite spells the in-memory sentinel as
+    # "sqlite:///:memory:", so the value seen here is "/:memory:".
+    stripped = path_part.lstrip("/")
+    if not stripped or stripped == ":memory:":
+        return remainder
+
+    relative = stripped.lstrip("./").lstrip("/")
+    if not relative:
+        return remainder
+
+    resolved = (PROJECT_ROOT / relative).resolve()
+
+    absolute = _encode_sqlite_absolute(resolved)
+    return f"{absolute}{separator}{query}" if separator else absolute
+
+
 class Settings(BaseSettings):
     """Validated, immutable view over the process environment."""
 
@@ -222,15 +339,13 @@ class Settings(BaseSettings):
 
         if scheme in {"postgres", "postgresql"}:
             scheme = "postgresql+asyncpg"
-        elif scheme in {"sqlite", "sqlite3"}:
-            # A relative sqlite path is resolved against the project root so the
-            # database lands in ./data no matter the launch directory.
-            if remainder.startswith("/") and not remainder.startswith("//"):
-                tail = remainder.lstrip("/")
-                if not tail or tail.startswith("./"):
-                    tail = tail.lstrip("./") or "data/zagrosian_eye.db"
-                remainder = f"./{tail}"
+        elif scheme in {"sqlite", "sqlite3", "sqlite+aiosqlite"}:
+            # Every SQLite spelling goes through the same path fixup, including
+            # the already-async form. Skipping "sqlite+aiosqlite" here is what
+            # let a three-slash DSN reach the engine as an absolute /data path
+            # and crash with PermissionError on a read-only Linux host.
             scheme = "sqlite+aiosqlite"
+            remainder = _normalize_sqlite_target(remainder)
         elif scheme in {"mysql", "mariadb"}:
             scheme = "mysql+asyncmy"
         elif scheme in {"postgresql+psycopg2", "psycopg2"}:

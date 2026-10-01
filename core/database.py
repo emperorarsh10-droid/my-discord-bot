@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -34,7 +35,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
-from config import get_settings
+from config import PROJECT_ROOT, ConfigurationError, get_settings
 from core.dashboard_state import HealthProbe, runtime_state
 from core.logging_setup import get_logger
 from core.models import Base, CaseCounter
@@ -61,21 +62,71 @@ class Database:
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
-    def _ensure_sqlite_directory(self) -> None:
-        """SQLite will not create intermediate directories, so we do it."""
-        if not self._settings.uses_sqlite:
-            return
-        from config import PROJECT_ROOT
+    def _sqlite_path(self) -> Path | None:
+        """Absolute path of the SQLite file, or ``None`` for in-memory.
 
-        _, _, tail = self._settings.database_url.partition("://")
-        # Strip the driver-specific query string before touching the path.
-        path_part = tail.split("?", 1)[0]
-        if not path_part or path_part == ":memory:" or path_part.startswith("//"):
+        ``config._normalize_sqlite_target`` has already resolved a relative
+        target against the project root, so by the time a DSN reaches here the
+        path is absolute and this returns it unchanged. The ``Path`` fallback
+        below is a safety net rather than the normal path.
+        """
+        if not self._settings.uses_sqlite:
+            return None
+
+        _, separator, remainder = self._settings.database_url.partition("://")
+        if not separator:
+            return None
+
+        # Strip any query string (?timeout=5 and friends) before touching it.
+        target = remainder.split("?", 1)[0]
+        if not target or target.lstrip("/") == ":memory:":
+            return None
+
+        # config._normalize_sqlite_target() re-emits relative paths as an
+        # absolute path in this host's dialect, which means the text here is not
+        # necessarily what the native Path() constructor expects:
+        #
+        #   POSIX    "sqlite:////srv/app.db"  -> database "/srv/app.db"
+        #   Windows  "sqlite:///C:/app.db"    -> database "C:/app.db"
+        #                                              (SQLAlchemy reads "C:" as host)
+        #
+        # Both arrive here with a leading slash that Path() would turn into a
+        # UNC root ("\\srv") or a doubled drive ("C:\C:"). Decoding the DSN form
+        # by hand, rather than trusting the platform, keeps this identical on
+        # every host — which is the whole point of the exercise.
+        candidate = Path(target.lstrip("/") if os.name == "nt" else target)
+        if not candidate.is_absolute():
+            candidate = PROJECT_ROOT / candidate
+        return candidate
+
+    def _ensure_sqlite_directory(self) -> None:
+        """Create the directory holding the SQLite file.
+
+        Failures are reported, not raised as ``PermissionError``: an unwritable
+        data directory is a deployment problem, and the connect attempt that
+        follows produces a far clearer error than a bare ``mkdir`` traceback.
+        """
+        db_path = self._sqlite_path()
+        if db_path is None:
             return
-        db_path = Path(path_part)
-        if not db_path.is_absolute():
-            db_path = PROJECT_ROOT / db_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        directory = db_path.parent
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ConfigurationError(
+                f"Cannot create the SQLite data directory {directory}: {exc}. "
+                "Point DATABASE_URL at a writable location, e.g. "
+                "sqlite+aiosqlite:///./data/zagrosian_eye.db (relative paths are "
+                f"resolved against {PROJECT_ROOT})."
+            ) from exc
+
+        if not os.access(directory, os.W_OK):
+            raise ConfigurationError(
+                f"SQLite data directory {directory} is not writable. A PaaS free "
+                "tier usually mounts the app read-only; use PostgreSQL instead "
+                "(DATABASE_URL=postgresql+asyncpg://user:pass@host/db)."
+            )
 
     def _build_engine(self) -> AsyncEngine:
         self._ensure_sqlite_directory()
