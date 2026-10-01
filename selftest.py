@@ -46,6 +46,30 @@ PASS, FAIL = 0, 0
 
 _SELFTEST_DB = Path("data/_selftest.db")
 
+#: Every table the ORM maps. Asserted as a set in both directions so a new model
+#: that is never created, and a database table with no model behind it, both fail.
+EXPECTED_TABLES: frozenset[str] = frozenset(
+    {
+        "blacklist_entries",
+        "case_counters",
+        "channel_snapshots",
+        "giveaway_entries",
+        "giveaways",
+        "guild_backups",
+        "guild_configs",
+        "guild_filters",
+        "guild_ignores",
+        "guild_notes",
+        "guild_settings",
+        "mod_cases",
+        "poll_votes",
+        "polls",
+        "reaction_role_rules",
+        "sticky_messages",
+        "temp_role_grants",
+    }
+)
+
 
 def _purge_selftest_db() -> None:
     """Remove the self-test SQLite files so every run starts from zero.
@@ -68,6 +92,142 @@ def check(label: str, condition: bool, detail: str = "") -> None:
     else:
         FAIL += 1
         print(f"  FAIL  {label}  [{detail}]")
+
+
+def _migration_checks() -> None:
+    """Prove an old-build guild_configs table gains every new column.
+
+    An additive migration only ever runs against a database created by an older
+    release, so a test that starts from the current schema proves nothing. This
+    builds the pre-AutoMod table shape with a live row in it, then runs the real
+    migration path: a text default has to render as a quoted literal, or SQLite
+    reads ``DEFAULT delete`` as a syntax error and the bot never boots.
+    """
+    from sqlalchemy import MetaData, Table, create_engine, inspect, text
+
+    from core.database import _add_missing_columns_sync
+    from core.models import Base, GuildConfig
+
+    added = [
+        "automod_enabled",
+        "automod_duplicate_action",
+        "automod_caps_action",
+        "automod_invite_action",
+        "warn_timeout_at",
+        "warn_kick_at",
+        "anticaps_percent",
+        "anticaps_min_length",
+        "spam_window_seconds",
+        "spam_max_messages",
+        "spam_timeout_seconds",
+        "anti_invite",
+        "panic_active",
+    ]
+
+    # A Column cannot belong to two Table objects, so each copy gets its own.
+    def _columns(names: set[str]) -> list:
+        return [c._copy() for c in GuildConfig.__table__.columns if c.name in names]
+
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        legacy_table = Table(
+            "guild_configs",
+            MetaData(),
+            *_columns(set(GuildConfig.__table__.columns.keys()) - set(added)),
+        )
+        legacy_table.create(bind=conn)
+        required = [c for c in legacy_table.columns if c.nullable is False]
+        names = [c.name for c in required]
+        # Identifiers come from the ORM metadata, never from input.
+        collist = ", ".join(names)
+        placeholders = ", ".join(f":{n}" for n in names)
+        conn.execute(
+            text(f"INSERT INTO guild_configs ({collist}) VALUES ({placeholders})"),  # noqa: S608
+            {
+                c.name: (1 if type(c.type).__name__ == "Integer" else "x")
+                for c in required
+            },
+        )
+
+        # Only the columns absent from the legacy shape, so the "missing" set is
+        # exactly what an upgrading server would need.
+        target = Table("guild_configs", MetaData(), *_columns(set(added)))
+        try:
+            added_now = _add_missing_columns_sync(conn, target.metadata)
+            check(
+                "migration adds every new column",
+                {name.split(".", 1)[1] for name in added_now} == set(added),
+                str(sorted(added_now)),
+            )
+            columns = {c["name"] for c in inspect(conn).get_columns("guild_configs")}
+            check("legacy table ends up complete", set(added) <= columns, f"missing: {sorted(set(added) - columns)}")
+            row = conn.execute(
+                text(
+                    "SELECT automod_enabled, automod_duplicate_action,"
+                    " warn_timeout_at, anti_invite FROM guild_configs"
+                )
+            ).one()
+            # Booleans land as 0/1 and text defaults as quoted literals; an
+            # unquoted `delete` here is a syntax error, not a value.
+            check(
+                "existing row gets usable defaults",
+                tuple(row) == (0, "delete", 3, 0),
+                str(tuple(row)),
+            )
+        except Exception as exc:  # the exception text is the assertion detail
+            check("migration adds every new column", False, f"{type(exc).__name__}: {exc}")
+
+        check(
+            "model defaults match the migration defaults",
+        GuildConfig(guild_id=1).automod_duplicate_action == "delete",
+        str(GuildConfig(guild_id=1).automod_duplicate_action),
+    )
+
+    # A multi-choice poll needs more than one row per member, which the original
+    # (poll_id, user_id) key structurally forbids. This walks a real old table
+    # through the constraint migration.
+    from core.models import PollVote
+
+    keys = {tuple(c.name for c in c.columns) for c in PollVote.__table__.constraints}
+    check("poll vote key includes option_index", ("poll_id", "user_id", "option_index") in keys, str(keys))
+
+    def _vote_key_migration() -> None:
+        engine2 = create_engine("sqlite://")
+        with engine2.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE poll_votes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    poll_id INTEGER NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    option_index INTEGER NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (poll_id, user_id)
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO poll_votes (poll_id, user_id, option_index) VALUES (1, 42, 0)"
+            )
+            added = _add_missing_columns_sync(conn, MetaData())
+            check("poll vote key migration runs", "poll_votes.unique_key" in added, str(added))
+            conn.exec_driver_sql(
+                "INSERT INTO poll_votes (poll_id, user_id, option_index) VALUES (1, 42, 1)"
+            )
+            rows = conn.execute(text("SELECT option_index FROM poll_votes ORDER BY id")).scalars().all()
+            check("multi-choice votes both persist", rows == [0, 1], str(rows))
+            try:
+                conn.exec_driver_sql(
+                    "INSERT INTO poll_votes (poll_id, user_id, option_index) VALUES (1, 42, 1)"
+                )
+                check("same option twice still blocked", False, "no error raised")
+            except Exception as exc:
+                check("same option twice still blocked", "UNIQUE" in str(exc).upper(), type(exc).__name__)
+        engine2.dispose()
+
+    _vote_key_migration()
+    engine.dispose()
+    check("Base metadata still resolves after migration helpers ran", bool(Base.metadata.tables))
 
 
 async def main() -> int:
@@ -183,7 +343,17 @@ async def main() -> int:
     health = await database.health()
     check("health ok", health["ok"] is True, json.dumps(health.get("error")))
     check("health timed", isinstance(health["latency_ms"], (int, float)), f"{health['latency_ms']} ms")
-    check("tables mapped", len(health["tables"] or []) == 5, str(health["tables"]))
+    # Every mapped model must exist in the live database. Asserting the exact
+    # count instead would make this a change-detector: adding one table for a new
+    # feature would fail a test about database health, which is not what it is for.
+    mapped = set(health["tables"] or [])
+    missing = EXPECTED_TABLES - mapped
+    check("every mapped table exists", not missing, f"missing: {sorted(missing)}")
+    check(
+        "no unmapped tables in db",
+        not (mapped - EXPECTED_TABLES),
+        f"unexpected: {sorted(mapped - EXPECTED_TABLES)}",
+    )
 
     print("\n=== 4. case allocator (atomic) ===")
     numbers = await asyncio.gather(*[database.next_case_number(999) for _ in range(25)])
@@ -441,22 +611,36 @@ async def main() -> int:
     bot = build_bot(settings)
     failures = await load_extensions(bot, settings)
     check("no extension failures", list(failures) == [], str(failures))
-    check("3 cogs loaded", len(bot.cogs) == 3, str(sorted(bot.cogs)))
+    check("feature cogs loaded", len(bot.cogs) >= 3, str(sorted(bot.cogs)))
     if list(failures):
         print("  ABORT: extension failures, remaining command-tree checks skipped")
         return 1
-    # walk_commands() recurses into groups, so subcommands appear as "setup logs"
+    # walk_commands() recurses into groups, so subcommands appear as "config logs"
     commands = {c.qualified_name: c for c in bot.tree.walk_commands()}
     top_level = {c.name for c in bot.tree.get_commands()}
-    check("setup group registered", "setup" in top_level, str(sorted(top_level)))
-    for expected in ("ban", "kick", "mute", "unmute", "warn", "warnings", "clear",
+    check("config group registered", "config" in top_level, str(sorted(top_level)))
+    for expected in ("ban", "kick", "mute", "unmute", "warn", "warnings", "purge",
                      "settings", "toggle-dm", "serverinfo", "system", "status", "test",
                      "sync", "reload",
                      "userinfo", "slowmode", "lockdown", "unlock", "botstatus",
                      "massban", "softban", "tempban",
-                     "filter", "embed_builder", "backup_create", "backup_load",
-                     "setup logs", "setup muted-role"):
+                     "filter", "embed_builder", "embed", "backup_create", "backup_load",
+                     "config logs", "config muted-role",
+                     "timeout", "untimeout", "warns", "clearwarns", "infractions",
+                     "reason", "notes add", "notes view", "cases", "viewcase",
+                     "unban", "banlist",
+                     "panic", "unpanic", "lockdownall", "unlockall", "slowmodeall",
+                     "antiinvite", "antispam", "blacklist add", "blacklist remove",
+                     "blacklist list", "nuke", "invites", "clean",
+                     "nick", "role", "whois", "avatar", "verify", "altcheck",
+                     "strip", "roleall", "temprole", "dm", "modstats",
+                     "ignore", "unignore", "topic", "setup", "modhelp",
+                     "sticky", "unsticky", "poll", "giveaway", "reactionrole",
+                     "vckick", "vcmute", "vcunmute", "vclock", "vcunlock",
+                     "automod status", "automod enable", "automod caps",
+                     "automod spam", "automod reset"):
         check(f"/{expected} present", expected in commands)
+    check("automod group registered", "automod" in top_level, str(sorted(top_level)))
     payload = [c.to_dict() for c in bot.tree.get_commands()]
     check("tree serialises to JSON", len(json.dumps(payload)) > 500)
 
@@ -482,14 +666,30 @@ async def main() -> int:
           not_guild == ["reload", "status", "sync", "test"],
           str(not_guild))
 
-    clear = commands["clear"].to_dict()
-    amount = next(o for o in clear["options"] if o["name"] == "amount")
-    check("clear bound comes from MAX_PURGE_AMOUNT",
+    purge = commands["purge"].to_dict()
+    amount = next(o for o in purge["options"] if o["name"] == "amount")
+    check("purge bound comes from MAX_PURGE_AMOUNT",
           amount["max_value"] == settings.max_purge_amount,
           f"option max {amount['max_value']} vs config {settings.max_purge_amount}")
+    # /clear is kept as a live alias: discord.py has no slash-command alias, so a
+    # guild with it in saved commands would otherwise just get "unknown command".
+    check("clear alias still registered", "clear" in commands, str(sorted(commands)[:5]))
+    check(
+        "clear alias has the same bounds",
+        next(o for o in commands["clear"].to_dict()["options"] if o["name"] == "amount")["max_value"]
+        == amount["max_value"],
+    )
 
-    check("runtime_state knows cogs", len(runtime_state.snapshot()["cogs_loaded"]) == 3,
-          str(runtime_state.snapshot()["cogs_loaded"]))
+    # At least one cog must have registered, and every name reported must be one
+    # the tree actually holds: a stale counter in runtime_state would otherwise
+    # make /status lie about the running feature set.
+    loaded_cogs = runtime_state.snapshot()["cogs_loaded"]
+    check("runtime_state knows cogs", bool(loaded_cogs), str(loaded_cogs))
+    check(
+        "runtime_state cogs match the tree",
+        set(loaded_cogs) <= set(bot.extensions),
+        f"stale: {sorted(set(loaded_cogs) - set(bot.extensions))}",
+    )
 
     print("\n=== 7. bulk target parsing ===")
     from core.targets import MAX_BULK_TARGETS, parse_user_ids
@@ -518,7 +718,11 @@ async def main() -> int:
     from core.automod import (
         MAX_KEYWORD_LEN,
         MAX_PHRASES,
+        AutoMod,
+        AutoModSettings,
         clean_phrases,
+        extract_invite_codes,
+        looks_like_shouting,
         matches_phrase,
         normalize_phrase,
     )
@@ -526,12 +730,98 @@ async def main() -> int:
     check("normalize lowercases + trims", normalize_phrase("  HeLLo  ") == "hello")
     check("normalize collapses inner spaces", normalize_phrase("a   b") == "a b")
     check("clean drops empties and dupes", clean_phrases(["a", "A", " ", "b"]) == ["a", "b"])
-    check("clean enforces the length cap", all(len(p) <= MAX_KEYWORD_LEN for p in clean_phrases(["x" * 500])))
+    # Over-long keywords are rejected loudly rather than truncated: silently cutting
+# "free" down to "fre" would block innocent words, which is worse than an error.
+    try:
+        clean_phrases(["x" * (MAX_KEYWORD_LEN + 1)])
+        check("clean rejects over-long keywords", False, "no error raised")
+    except ValueError as exc:
+        check("clean rejects over-long keywords", "limit" in str(exc).lower(), str(exc))
+    check(
+        "clean keeps a keyword at exactly the cap",
+        clean_phrases(["y" * MAX_KEYWORD_LEN]) == ["y" * MAX_KEYWORD_LEN],
+    )
     check("phrase hit is substring, case-insensitive",
-          matches_phrase("well HELLO there", ["hello"]) is True)
-    check("phrase miss is False", matches_phrase("nothing here", ["hello"]) is False)
-    check("empty phrase list never matches", matches_phrase("anything", []) is False)
+          matches_phrase("well HELLO there", "hello") is True)
+    check("phrase miss is False", matches_phrase("nothing here", "hello") is False)
+    check("empty phrase never matches", matches_phrase("anything", "") is False)
+    check(
+        "phrase match respects word boundaries",
+        matches_phrase("that party started", "art") is False,
+    )
+    check(
+        "multi-word phrase matches across the whitespace",
+        matches_phrase("say   free   nitro now", "free nitro") is True,
+    )
     check("MAX_PHRASES is a real bound", 0 < MAX_PHRASES <= 1000, str(MAX_PHRASES))
+
+    check("shouting is detected", looks_like_shouting("WHY IS NOBODY LISTENING", 70, 12) is True)
+    check("a short shout is exempt",
+          looks_like_shouting("OK NO", 70, 12) is False)
+    check("ordinary sentence is not shouting",
+          looks_like_shouting("hello everyone how are you", 70, 12) is False)
+    check("digits and punctuation are not letters",
+          looks_like_shouting("1234567890 !!!!!", 70, 4) is False)
+    codes = extract_invite_codes("come to discord.gg/abcdef and also http://discord.com/invite/xyz123")
+    check("both invite forms are found", len(codes) >= 2, str(codes))
+
+    # The rate window is the piece with no Discord API to lean on, so it is
+    # driven directly: a flooder must trip exactly once, and a member who stops
+    # talking must not inherit a stale window after the gap closes.
+    spam_settings = AutoModSettings(
+        enabled=True,
+        spam_window_seconds=10,
+        spam_max_messages=3,
+        spam_timeout_seconds=60,
+    )
+
+    class _Member:
+        def __init__(self, uid: int) -> None:
+            self.id = uid
+            self.roles: list = []
+
+    class _Channel:
+        id = 555
+
+    class _Guild:
+        id = 777
+
+    class _Message:
+        def __init__(self, uid: int, content: str) -> None:
+            self.author = _Member(uid)
+            self.content = content
+            self.channel = _Channel()
+            self.guild = _Guild()
+
+    engine = AutoMod(bot=None)  # type: ignore[arg-type]
+    verdicts = [
+        engine._check_spam(_Message(1, f"msg {i}"), spam_settings)
+        for i in range(6)
+    ]
+    tripped = [v for v in verdicts if v.tripped]
+    check("flood trips once, not per message", len(tripped) == 1, str(len(tripped)))
+    check("flood verdict is the spam rule",
+          tripped and tripped[0].action == "spam", str(tripped[0].detail if tripped else None))
+    # The window resets on trip, so the messages that follow start a new window
+    # rather than each re-triggering the same punishment.
+    check("post-trip window restarts from scratch",
+          len(engine._rates.get(1, [])) < 3, str(engine._rates.get(1)))
+
+    slow = AutoMod(bot=None)  # type: ignore[arg-type]
+    for i in range(3):
+        slow._check_spam(_Message(2, f"msg {i}"), spam_settings)
+    # Backdate every timestamp past the window: a member who waits out the window
+    # starts fresh instead of tripping on the fourth message an hour later.
+    engine_stale = slow._rates.get(2)
+    check("rate window recorded", engine_stale is not None and len(engine_stale) == 3, str(engine_stale))
+    # Replace the list, not the elements: rebinding a local float does nothing.
+    slow._rates[2] = [stamp - 60 for stamp in slow._rates[2]]
+    late = slow._check_spam(_Message(2, "later"), spam_settings)
+    check("stale window does not trip", not late.tripped, late.detail)
+    slow.forget(2)
+    check("forget clears rate state", slow._rates.get(2) is None, str(slow._rates.get(2)))
+    slow.forget(2)  # idempotent
+    check("forget twice is safe", slow._rates.get(2) is None)
 
     print("\n=== 9. backup codec ===")
     from core.backup import decode_payload, encode_payload, summarize_backup
@@ -595,10 +885,14 @@ async def main() -> int:
     print("\n=== 12. schema ===")
     from core.models import Base, GuildBackup, GuildFilter
 
-    tables = sorted(Base.metadata.tables)
-    check("5 tables mapped", len(tables) == 5, str(tables))
-    for name in ("guild_filters", "guild_backups"):
-        check(f"{name} table present", name in tables, str(tables))
+    tables = set(Base.metadata.tables)
+    check(
+        "every model mapped",
+        tables == EXPECTED_TABLES,
+        f"diff: {sorted(tables ^ EXPECTED_TABLES)}",
+    )
+    for name in sorted(EXPECTED_TABLES):
+        check(f"{name} table present", name in tables)
     check("GuildFilter is mapped", GuildFilter.__tablename__ == "guild_filters")
     check("GuildBackup is mapped", GuildBackup.__tablename__ == "guild_backups")
     for action in ("MASSBAN", "SOFTBAN", "TEMPBAN", "AUTOMOD"):
@@ -611,6 +905,9 @@ async def main() -> int:
 
     print("\n=== 12b. health server (Render keep-alive) ===")
     await _health_server_checks()
+
+    print("\n=== 12c. additive column migration ===")
+    _migration_checks()
 
     print("\n=== 13. teardown ===")
     await database.disconnect()

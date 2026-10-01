@@ -134,15 +134,20 @@ def verification_label(level: discord.VerificationLevel) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# /setup — one-time provisioning
+# /config — individual provisioning tasks
 #
 # A module-level Group instance is required: the group must exist at import time
-# for ``@setup_group.command()`` to attach to it, and it is grafted onto the
+# for ``@config_group.command()`` to attach to it, and it is grafted onto the
 # command tree by ``Management.cog_load``.
+#
+# This used to be ``/setup``. The root ``/setup`` is now the guided wizard
+# (see ``cogs/manual.py``) and Discord will not host a group and a command under
+# one name, so the per-task commands moved to ``/config``. ``/config logs`` and
+# ``/config muted-role`` are the same operations as before.
 # --------------------------------------------------------------------------- #
-setup_group = app_commands.Group(
-    name="setup",
-    description="One-time server provisioning for the bot.",
+config_group = app_commands.Group(
+    name="config",
+    description="Individual provisioning tasks for the bot.",
 )
 
 
@@ -156,16 +161,16 @@ class Management(commands.Cog):
         self._pending_drafts: dict[int, int] = {}
 
     async def cog_load(self) -> None:
-        self.bot.tree.add_command(setup_group)
-        logger.debug("Registered /setup group")
+        self.bot.tree.add_command(config_group)
+        logger.debug("Registered /config group")
 
     def cog_unload(self) -> None:
-        self.bot.tree.remove_command("setup")
+        self.bot.tree.remove_command("config")
 
     # ------------------------------------------------------------------ #
-    # /setup logs
+    # /config logs
     # ------------------------------------------------------------------ #
-    @setup_group.command(
+    @config_group.command(
         name="logs", description="Route moderation logs to a specific channel."
     )
     @app_commands.guild_only
@@ -238,9 +243,9 @@ class Management(commands.Cog):
         )
 
     # ------------------------------------------------------------------ #
-    # /setup muted-role
+    # /config muted-role
     # ------------------------------------------------------------------ #
-    @setup_group.command(
+    @config_group.command(
         name="muted-role",
         description="Choose, or create and position, the role used by /mute.",
     )

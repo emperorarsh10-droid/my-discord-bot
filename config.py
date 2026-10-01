@@ -292,6 +292,13 @@ class Settings(BaseSettings):
         description="Async SQLAlchemy DSN. Short forms are auto-normalized.",
     )
     database_timeout: float = Field(default=5.0, ge=0.1, le=120.0)
+    sqlite_pool_size: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Persistent aiosqlite connections. Higher buys read "
+        "concurrency; lower reduces write-lock contention.",
+    )
 
     # -- Operations ---------------------------------------------------------
     log_level: str = Field(default="INFO")

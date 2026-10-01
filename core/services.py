@@ -12,12 +12,13 @@ substitute a fixture; ``get_database()`` is only the default.
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
-from typing import Final
+from typing import Any, Final
 
 import discord
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from config import get_settings
@@ -37,7 +38,15 @@ from core.errors import (
     PermissionDeniedError,
 )
 from core.logging_setup import command_context, get_logger
-from core.models import CaseAction, GuildConfig, GuildFilter, ModCase, utcnow
+from core.models import (
+    CaseAction,
+    ChannelSnapshot,
+    GuildConfig,
+    GuildFilter,
+    GuildSetting,
+    ModCase,
+    utcnow,
+)
 
 __all__ = [
     "AUDIT_REASON_LIMIT",
@@ -206,6 +215,534 @@ async def fetch_active_cases(
     except (SQLAlchemyError, RuntimeError) as exc:
         logger.warning("Case history lookup failed for guild %s: %s", guild_id, exc)
         return []
+
+
+# --------------------------------------------------------------------------- #
+# Ledger queries shared by the infraction-history commands
+# --------------------------------------------------------------------------- #
+@command_context("service:fetch_case_history")
+async def fetch_case_history(
+    guild_id: int,
+    *,
+    user_id: int | None = None,
+    action: str | None = None,
+    include_revoked: bool = True,
+    limit: int = 25,
+    offset: int = 0,
+    database: Database | None = None,
+) -> list[ModCase]:
+    """Newest-first cases, optionally filtered by user and/or action.
+
+    Unlike :func:`fetch_active_cases` this can include revoked rows and skips
+    over them with ``offset``, which is what the paginated ``/cases`` browser
+    needs. Returns ``[]`` on any database failure rather than raising: a history
+    view must still render when the ledger is down.
+    """
+    db = database or get_database()
+    try:
+        async with db.session() as session:
+            statement = select(ModCase).where(ModCase.guild_id == guild_id)
+            if user_id is not None:
+                statement = statement.where(ModCase.user_id == user_id)
+            if action:
+                statement = statement.where(ModCase.action == action)
+            if not include_revoked:
+                statement = statement.where(ModCase.is_active.is_(True))
+            statement = (
+                statement.order_by(ModCase.case_number.desc())
+                .offset(max(0, offset))
+                .limit(max(1, min(limit, 100)))
+            )
+            result = await session.execute(statement)
+            return list(result.scalars().all())
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning("Case history lookup failed for guild %s: %s", guild_id, exc)
+        return []
+
+
+@command_context("service:count_case_history")
+async def count_case_history(
+    guild_id: int,
+    *,
+    user_id: int | None = None,
+    action: str | None = None,
+    include_revoked: bool = True,
+    database: Database | None = None,
+) -> int:
+    """Total matching rows, for computing page counts."""
+    db = database or get_database()
+    try:
+        async with db.session() as session:
+            statement = select(func.count()).select_from(ModCase).where(
+                ModCase.guild_id == guild_id
+            )
+            if user_id is not None:
+                statement = statement.where(ModCase.user_id == user_id)
+            if action:
+                statement = statement.where(ModCase.action == action)
+            if not include_revoked:
+                statement = statement.where(ModCase.is_active.is_(True))
+            return int((await session.execute(statement)).scalar_one())
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning("Case history count failed for guild %s: %s", guild_id, exc)
+        return 0
+
+
+@command_context("service:find_case")
+async def find_case(
+    guild_id: int, needle: str, database: Database | None = None
+) -> ModCase | None:
+    """Resolve ``needle`` to a case.
+
+    Accepts a case reference (``ZEYE-000042``), a bare case number, or the
+    Discord user id — three spellings because moderators paste all three. Snowflake
+    length disambiguates user ids from case numbers.
+    """
+    db = database or get_database()
+    cleaned = (needle or "").strip().lstrip("#")
+    if not cleaned:
+        return None
+
+    # Discord snowflakes are 17-20 digits; a case number is never that long, so
+    # digit length alone disambiguates "user id" from "case number".
+    is_snowflake = cleaned.isdigit() and len(cleaned) >= 15
+
+    try:
+        async with db.session() as session:
+            if is_snowflake:
+                criteria = ModCase.user_id == int(cleaned)
+            elif cleaned.isdigit():
+                criteria = ModCase.case_number == int(cleaned)
+            else:
+                criteria = ModCase.case_ref == cleaned
+
+            result = await session.execute(
+                select(ModCase)
+                .where(ModCase.guild_id == guild_id, criteria)
+                .order_by(ModCase.case_number.desc())
+            )
+            rows = list(result.scalars().all())
+            return rows[0] if rows else None
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning("Case lookup failed for %r in guild %s: %s", needle, guild_id, exc)
+        return None
+
+
+@command_context("service:revoke_cases")
+async def revoke_cases(
+    guild_id: int,
+    *,
+    user_id: int | None = None,
+    case_ref: str | None = None,
+    actions: tuple[CaseAction, ...] | None = None,
+    moderator_id: int,
+    reason: str,
+    database: Database | None = None,
+) -> int:
+    """Mark matching active cases revoked. Returns the number changed.
+
+    Revocation never deletes a row: the ledger is the audit trail, and a
+    ``/clearwarns`` that erased the warning would erase the evidence that a
+    moderator issued it.
+
+    ``actions`` narrows the sweep to one kind of sanction. Lifting a mute must
+    not silently clear an active timeout or ban for the same member — the member
+    would read their mod history as clean while still being restricted.
+    """
+    db = database or get_database()
+    try:
+        async with db.session() as session:
+            statement = select(ModCase).where(
+                ModCase.guild_id == guild_id, ModCase.is_active.is_(True)
+            )
+            if case_ref is not None:
+                statement = statement.where(ModCase.case_ref == case_ref)
+            if user_id is not None:
+                statement = statement.where(ModCase.user_id == user_id)
+            if actions is not None:
+                statement = statement.where(
+                    ModCase.action.in_([action.value for action in actions])
+                )
+            rows = list((await session.execute(statement)).scalars().all())
+            for row in rows:
+                row.is_active = False
+                row.revoked_by = moderator_id
+                row.revoked_reason = truncate(reason, 2000) if reason else None
+            return len(rows)
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning("Case revocation failed for guild %s: %s", guild_id, exc)
+        return 0
+
+
+@command_context("service:count_active_warnings")
+async def count_active_warnings(
+    guild_id: int, user_id: int, database: Database | None = None
+) -> int:
+    """How many *active* warnings a member currently holds — the warn-ladder rung."""
+    db = database or get_database()
+    try:
+        async with db.session() as session:
+            statement = select(func.count()).select_from(ModCase).where(
+                ModCase.guild_id == guild_id,
+                ModCase.user_id == user_id,
+                ModCase.action == CaseAction.WARN.value,
+                ModCase.is_active.is_(True),
+            )
+            return int((await session.execute(statement)).scalar_one())
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning("Warning count failed for %s/%s: %s", guild_id, user_id, exc)
+        return 0
+
+
+# --------------------------------------------------------------------------- #
+# Channel permission snapshots
+# --------------------------------------------------------------------------- #
+#: Maps ``discord.abc.PermissionOverwrite.target_type`` to a short stable token.
+#: The enum's *values* are an implementation detail of discord.py and are not
+#: safe to persist, so the mapping is explicit and travels with the data.
+_OVERWRITE_TARGETS: Final[dict[int, str]] = {
+    0: "role",
+    1: "member",
+}
+
+
+@command_context("service:overwrites_to_json")
+def overwrites_to_json(channel: discord.abc.GuildChannel) -> str:
+    """Serialise a channel's permission overwrites losslessly.
+
+    Each overwrite becomes ``[kind, target_id, allow, deny]`` where ``allow`` and
+    ``deny`` are the raw bitfields. Persisting the *mask* rather than the
+    individual booleans is what makes a restore exact: ``Permissions`` carries
+    several dozen independent flags and naming them one by one would silently
+    drop every flag nobody remembered.
+    """
+    payload = [
+        [
+            _OVERWRITE_TARGETS.get(int(item.type), "role"),
+            int(item.id),
+            int(item.allow),
+            int(item.deny),
+        ]
+        for item in channel.overwrites
+    ]
+    return json.dumps(payload)
+
+
+@command_context("service:json_to_overwrites")
+def json_to_overwrites(payload: str) -> list[tuple[str, int, int, int]]:
+    """Inverse of :func:`overwrites_to_json`. Malformed rows are skipped, not fatal."""
+    try:
+        raw = json.loads(payload or "[]")
+    except (TypeError, ValueError):
+        logger.warning("Discarding unreadable snapshot payload")
+        return []
+
+    out: list[tuple[str, int, int, int]] = []
+    for row in raw:
+        try:
+            kind, target_id, allow, deny = row
+            if kind not in ("role", "member"):
+                continue
+            out.append((str(kind), int(target_id), int(allow), int(deny)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+@command_context("service:save_channel_snapshot")
+async def save_channel_snapshot(
+    guild_id: int,
+    channel: discord.abc.GuildChannel,
+    label: str,
+    *,
+    created_by: int | None = None,
+    database: Database | None = None,
+) -> ChannelSnapshot | None:
+    """Record a channel's current permissions under ``label``.
+
+    Re-using a label replaces the previous snapshot, which is the behaviour
+    ``/panic`` wants: activating panic twice should not leave two stale copies
+    and make ``/unpanic`` ambiguous about which one is authoritative.
+    """
+    db = database or get_database()
+    meta = {
+        "name": getattr(channel, "name", ""),
+        "category_id": getattr(getattr(channel, "category", None), "id", None),
+        "position": getattr(channel, "position", None),
+        "topic": getattr(channel, "topic", None),
+        "nsfw": getattr(channel, "nsfw", None),
+    }
+    try:
+        async with db.session() as session:
+            existing = (
+                await session.execute(
+                    select(ChannelSnapshot).where(
+                        ChannelSnapshot.guild_id == guild_id,
+                        ChannelSnapshot.channel_id == channel.id,
+                        ChannelSnapshot.label == label,
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if existing is not None:
+                existing.overwrites = overwrites_to_json(channel)
+                existing.channel_meta = json.dumps(meta)
+                existing.created_by = created_by
+                existing.created_at = utcnow()
+                row = existing
+            else:
+                row = ChannelSnapshot(
+                    guild_id=guild_id,
+                    channel_id=channel.id,
+                    label=label,
+                    overwrites=overwrites_to_json(channel),
+                    channel_meta=json.dumps(meta),
+                    created_by=created_by,
+                )
+                session.add(row)
+            await session.commit()
+            return row
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.error("Snapshot save failed for channel %s: %s", channel.id, exc)
+        return None
+
+
+@command_context("service:restore_channel_snapshots")
+async def restore_channel_snapshots(
+    guild: discord.Guild,
+    label: str,
+    *,
+    database: Database | None = None,
+) -> tuple[int, int]:
+    """Re-apply every snapshot under ``label``. Returns ``(restored, missing)``.
+
+    ``missing`` counts channels that no longer exist — deleted while locked
+    down, which is exactly what ``/nuke`` does. Reporting the split matters:
+    "restored 8, 3 gone" is a complete answer, "restored 8" alone looks like the
+    other three were restored successfully.
+    """
+    db = database or get_database()
+    try:
+        async with db.session() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(ChannelSnapshot).where(
+                            ChannelSnapshot.guild_id == guild.id,
+                            ChannelSnapshot.label == label,
+                        )
+                    )
+                ).scalars()
+            )
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.error("Snapshot read failed for guild %s: %s", guild.id, exc)
+        return (0, 0)
+
+    restored = missing = 0
+    for row in rows:
+        channel = guild.get_channel(row.channel_id)
+        if channel is None:
+            missing += 1
+            continue
+        if not guild.me.guild_permissions.administrator and not (
+            guild.me.permissions_in(channel).manage_channels
+        ):
+            missing += 1
+            continue
+        try:
+            overwrites: dict[Any, discord.PermissionOverwrite] = {}
+            for kind, target_id, allow, deny in json_to_overwrites(row.overwrites):
+                target: Any
+                if kind == "role":
+                    target = guild.get_role(target_id)
+                    if target is None:
+                        continue
+                else:
+                    target = guild.get_member(target_id)
+                    if target is None:
+                        continue
+                overwrites[target] = discord.PermissionOverwrite(
+                    allow=discord.Permissions(allow), deny=discord.Permissions(deny)
+                )
+            await channel.edit(overwrites=overwrites, reason="Restoring saved permissions")
+            restored += 1
+        except discord.HTTPException as exc:
+            logger.warning("Restore failed for channel %s: %s", row.channel_id, exc)
+            missing += 1
+
+    return (restored, missing)
+
+
+@command_context("service:drop_snapshots")
+async def drop_snapshots(
+    guild_id: int, label: str, database: Database | None = None
+) -> int:
+    """Delete snapshots under ``label`` once they are no longer needed."""
+    db = database or get_database()
+    try:
+        async with db.session() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(ChannelSnapshot).where(
+                            ChannelSnapshot.guild_id == guild_id,
+                            ChannelSnapshot.label == label,
+                        )
+                    )
+                ).scalars()
+            )
+            for row in rows:
+                await session.delete(row)
+            return len(rows)
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning("Snapshot cleanup failed for guild %s: %s", guild_id, exc)
+        return 0
+
+
+# --------------------------------------------------------------------------- #
+# Arbitrary per-guild settings
+# --------------------------------------------------------------------------- #
+#: Values longer than this are rejected rather than truncated: a setting that does
+#: not fit is a bug in the caller, and silently truncating it produces a rule that
+#: behaves differently from what the moderator typed.
+MAX_SETTING_VALUE: Final[int] = 2000
+
+
+@command_context("service:set_setting")
+async def set_guild_config_flag(
+    guild_id: int,
+    column: str,
+    value: bool,
+    *,
+    database: Database | None = None,
+) -> bool:
+    """Set one boolean column on ``GuildConfig``, creating the row if needed.
+
+    Written as a targeted ``UPDATE`` rather than a read-modify-write: two
+    moderators panicking and unpanicking at once must not lose one of the
+    writes, and a detached ORM instance here is how the flag silently stops
+    persisting. Returns whether the write landed.
+    """
+    target = getattr(GuildConfig, column, None)
+    if target is None or not hasattr(target, "property"):
+        raise ValueError(f"{column!r} is not a boolean GuildConfig column")
+
+    db = database or get_database()
+    try:
+        async with db.session() as session:
+            updated = await session.execute(
+                update(GuildConfig)
+                .where(GuildConfig.guild_id == guild_id)
+                .values(**{column: bool(value)})
+            )
+            if not updated.rowcount:
+                session.add(GuildConfig(guild_id=guild_id, **{column: bool(value)}))
+            await session.commit()
+        return True
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning(
+            "Could not set %s=%s for guild %s: %s", column, value, guild_id, exc
+        )
+        return False
+
+
+async def set_setting(
+    guild_id: int,
+    key: str,
+    value: str,
+    *,
+    created_by: int | None = None,
+    database: Database | None = None,
+) -> bool:
+    """Upsert one setting. Returns ``False`` if the value was too long."""
+    if len(value) > MAX_SETTING_VALUE:
+        logger.warning("Refusing setting %r for guild %s: %d chars", key, guild_id, len(value))
+        return False
+
+    db = database or get_database()
+    try:
+        async with db.session() as session:
+            row = (
+                await session.execute(
+                    select(GuildSetting).where(
+                        GuildSetting.guild_id == guild_id, GuildSetting.key == key
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                session.add(
+                    GuildSetting(
+                        guild_id=guild_id, key=key, value=value, created_by=created_by
+                    )
+                )
+            else:
+                row.value = value
+                row.created_by = created_by
+            await session.commit()
+        return True
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning("Setting write failed for %r in guild %s: %s", key, guild_id, exc)
+        return False
+
+
+@command_context("service:get_setting")
+async def get_setting(
+    guild_id: int,
+    key: str,
+    default: str | None = None,
+    *,
+    database: Database | None = None,
+) -> str | None:
+    """Read one setting, or ``default`` when it is absent or unreadable."""
+    db = database or get_database()
+    try:
+        async with db.session() as session:
+            row = (
+                await session.execute(
+                    select(GuildSetting).where(
+                        GuildSetting.guild_id == guild_id, GuildSetting.key == key
+                    )
+                )
+            ).scalar_one_or_none()
+            return row.value if row is not None else default
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning("Setting read failed for %r in guild %s: %s", key, guild_id, exc)
+        return default
+
+
+@command_context("service:get_bool_setting")
+async def get_bool_setting(
+    guild_id: int, key: str, default: bool = False, *, database: Database | None = None
+) -> bool:
+    """Read a setting as a boolean. Anything unparseable falls back to ``default``."""
+    raw = await get_setting(guild_id, key, None, database=database)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@command_context("service:get_settings_prefix")
+async def get_settings_prefix(
+    guild_id: int, prefix: str, *, database: Database | None = None
+) -> dict[str, str]:
+    """Every setting whose key starts with ``prefix``, with the prefix stripped."""
+    db = database or get_database()
+    try:
+        async with db.session() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(GuildSetting).where(
+                            GuildSetting.guild_id == guild_id,
+                            GuildSetting.key.like(f"{prefix}%"),
+                        )
+                    )
+                ).scalars()
+            )
+            return {row.key[len(prefix):]: row.value for row in rows}
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning("Setting prefix read failed for %s in guild %s: %s", prefix, guild_id, exc)
+        return {}
 
 
 # --------------------------------------------------------------------------- #

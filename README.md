@@ -102,7 +102,7 @@ Copy-Item .env.example .env
 | **Authorization** | | |
 | `OWNER_IDS` | *(unset)* | Comma-separated user IDs for `/test`, `/sync`, `/reload`. Also grants rate-limit exemption. Accepts `123`, `123,456`, or a JSON list |
 | **Moderation defaults** | | |
-| `MAX_PURGE_AMOUNT` | `100` | Hard ceiling for `/clear`, 2–5000 |
+| `MAX_PURGE_AMOUNT` | `100` | Hard ceiling for `/purge`, 2–5000 |
 | `CASE_PREFIX` | `ZEYE` | Case-ID prefix, 2–8 chars |
 | `DEFAULT_MUTE_ROLE` | `Muted` | Role name auto-created by `/mute` when none is configured |
 | `DM_MEMBERS_ON_PUNISH` | `true` | **Global master switch** for punishment DMs. A per-guild override can only narrow this, never re-enable it |
@@ -163,7 +163,7 @@ First global sync can take up to an hour to propagate. Use
 | `/unmute <user> [reason]` | |
 | `/warn <user> <reason>` | |
 | `/warnings <user> [action]` | Case history, optionally filtered by action type |
-| `/clear <amount>` | Hard-capped by `MAX_PURGE_AMOUNT`, re-validated against the live setting |
+| `/purge <amount>` | Hard-capped by `MAX_PURGE_AMOUNT`, re-validated against the live setting |
 | `/massban <targets> [reason] [delete_days]` | Up to 100 IDs at once. Accepts raw IDs, `<@id>` pings, or a mixed paste. Bounded to 5 concurrent requests, one ledger case per account |
 | `/softban <user> [reason] [delete_days]` | Bans to purge history, then unbans so they can rejoin. Reports honestly if the lift step failed |
 | `/tempban <user> <duration> [reason] [delete_days]` | Lifts itself. Accepts users who already left; the sweeper runs every 5 minutes |
@@ -262,7 +262,7 @@ core/
   backup.py            Sealed codec, guild serialisation, conservative restore
 
 cogs/
-  moderation.py        /ban /kick /mute /unmute /warn /warnings /clear /massban
+  moderation.py        /ban /kick /mute /unmute /warn /warnings /purge /massban
                        /softban /tempban + expiry sweeper
   management.py        /setup /settings /toggle-dm /userinfo /slowmode /lockdown
                        /unlock /filter /embed_builder /backup_* /botstatus
@@ -309,7 +309,7 @@ existing table's columns is not supported.
 
 ## Safety properties
 
-- **Rate limiting.** 5 punitive actions per 30s per guild, 3 `/clear` per 30s. Bot
+- **Rate limiting.** 5 punitive actions per 30s per guild, 3 `/purge` per 30s. Bot
   owners are exempt. `discord.py` 2.3.2 has no built-in `app_commands.cooldown`, so
   this is a hand-rolled sliding window. `/massban` additionally caps itself at 5
   concurrent requests, because 100 parallel REST calls would stall unrelated
@@ -427,7 +427,7 @@ that were not valid snowflakes instead of silently dropping them.
 different bot token, or edited. Backups are sealed with the token, so changing
 `DISCORD_BOT_TOKEN` orphans every existing backup.
 
-**`/clear` says the amount is too high.** `MAX_PURGE_AMOUNT` is a hard ceiling
+**`/purge` says the amount is too high.** `MAX_PURGE_AMOUNT` is a hard ceiling
 re-validated server-side regardless of client input. Raise it in `.env` if intended.
 
 **Mutes or tempbans did not lift.** The sweeper runs every 5 minutes and starts in

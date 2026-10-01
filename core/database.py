@@ -24,7 +24,22 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Final
 
-from sqlalchemy import event, select, text
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Connection,
+    Dialect,
+    Enum,
+    Inspector,
+    Integer,
+    MetaData,
+    String,
+    Text,
+    event,
+    inspect,
+    select,
+    text,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
@@ -33,7 +48,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from config import PROJECT_ROOT, ConfigurationError, get_settings
 from core.dashboard_state import HealthProbe, runtime_state
@@ -45,6 +60,148 @@ __all__ = ["Database", "get_database", "reset_database"]
 logger = get_logger("zagrosian.database")
 
 _PROBE_STATEMENT: Final[str] = "SELECT 1"
+
+#: Seconds a checkout waits for a free connection before raising. Matches the
+#: default slash-command interaction budget so a saturated pool surfaces as a
+#: clean error well inside Discord's 3s initial-response window being deferred.
+SQLITE_POOL_TIMEOUT: Final[float] = 30.0
+
+
+def render_literal(value: Any, dialect: Dialect) -> str:
+    """Render a Python default as SQL text safe for this dialect.
+
+    A bare ``server_default="delete"`` reaches SQLite as the token ``delete``,
+    which is a syntax error, not a string. Embedding the value through the
+    dialect's own escaping is what makes the migration portable; hand-rolling
+    quotes here is how a Windows path or an apostrophe breaks the boot.
+    """
+    # Escape single quotes by doubling them, which both SQLite and PostgreSQL
+    # accept for a text default. Numeric defaults need no quoting.
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text_value = str(value).replace("'", "''")
+    return f"'{text_value}'"
+
+
+def _column_ddl(column: Column[Any], dialect: Dialect) -> str:
+    """Render one column as portable ``ADD COLUMN`` DDL.
+
+    Only types this bot actually uses are handled. An unknown type raises rather
+    than emitting SQL that would fail on one dialect and silently succeed on
+    another — a loud boot failure beats a column that exists with the wrong
+    shape.
+    """
+    resolved = column.type.compile(dialect=dialect)
+    # Enum renders as its name, which the live table already has; VARCHAR is the
+    # portable stand-in for anything textual.
+    if isinstance(column.type, (String, Text, Enum)):
+        resolved = "VARCHAR"
+    # BigInteger on SQLite is a 64-bit INTEGER under the hood, and the dialect
+    # renders it as BIGINT which SQLite accepts but normalises to INTEGER.
+    if isinstance(column.type, (BigInteger, Integer)):
+        resolved = "INTEGER"
+
+    parts = [column.name, resolved]
+    if not column.nullable:
+        # Only ever reachable for a column that also carries a server default;
+        # a NOT NULL addition without one would fail against existing rows.
+        server_default = column.server_default
+        if server_default is None:
+            raise RuntimeError(
+                f"column {column.name!r} is NOT NULL with no server default; "
+                "add a default so the migration can populate existing rows"
+            )
+        parts.append(f"DEFAULT {render_literal(server_default.arg, dialect)}")
+    return " ".join(parts)
+
+
+def _add_missing_columns_sync(connection: Connection, metadata: MetaData) -> list[str]:
+    """Add absent columns in place. Returns ``table.column`` names added.
+
+    Runs on the sync ``Connection`` that ``AsyncConnection.run_sync`` provides.
+    The dialect is read from that connection rather than guessed, so the rendered
+    DDL matches the server that will execute it.
+    """
+    # The Dialect object itself, not its name: TypeEngine.compile() resolves
+    # type names and default renderers through it.
+    dialect = connection.dialect
+    inspector = inspect(connection)
+    existing_tables = set(inspector.get_table_names())
+    added: list[str] = []
+
+    for table in metadata.sorted_tables:
+        # A table absent here was just created by create_all, so it already has
+        # every column in the metadata and there is nothing to reconcile.
+        if table.name not in existing_tables:
+            continue
+
+        present = {column["name"] for column in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in present:
+                continue
+            ddl = _column_ddl(column, dialect)
+            connection.exec_driver_sql(
+                f'ALTER TABLE {table.name} ADD COLUMN {ddl}'
+            )
+            added.append(f"{table.name}.{column.name}")
+
+    added.extend(_migrate_poll_vote_key(connection, inspector))
+    return added
+
+
+def _migrate_poll_vote_key(connection: Connection, inspector: Inspector) -> list[str]:
+    """Widen ``poll_votes``'s unique key to include ``option_index``.
+
+    The original key was ``(poll_id, user_id)``, which structurally forbids a
+    multi-choice poll from recording more than one selection per member. Adding a
+    column cannot fix that, so the constraint has to be dropped and recreated;
+    SQLite and PostgreSQL spell that differently, which is why it is one branch
+    per dialect rather than a generic attempt.
+    """
+    if "poll_votes" not in set(inspector.get_table_names()):
+        return []
+
+    wanted = {"poll_id", "user_id", "option_index"}
+    for constraint in inspector.get_unique_constraints("poll_votes"):
+        columns = set(constraint.get("column_names") or ())
+        if columns == wanted:
+            return []
+
+    logger.info("Widening poll_votes unique key to (poll_id, user_id, option_index)")
+    if connection.dialect.name == "postgresql":
+        connection.exec_driver_sql("ALTER TABLE poll_votes DROP CONSTRAINT uq_poll_vote")
+    else:
+        # SQLite cannot drop a constraint; recreating the table is the only way.
+        connection.exec_driver_sql("DROP TABLE IF EXISTS poll_votes__old")
+        connection.exec_driver_sql(
+            "CREATE TABLE poll_votes__old AS SELECT * FROM poll_votes"
+        )
+        connection.exec_driver_sql("DROP TABLE poll_votes")
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE poll_votes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                poll_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
+                option_index INTEGER NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (poll_id, user_id, option_index)
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO poll_votes SELECT * FROM poll_votes__old"
+        )
+        connection.exec_driver_sql("DROP TABLE poll_votes__old")
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_poll_votes_poll_id ON poll_votes (poll_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_poll_votes_user_id ON poll_votes (user_id)"
+        )
+    return ["poll_votes.unique_key"]
 
 
 class Database:
@@ -141,9 +298,19 @@ class Database:
         }
 
         if self._settings.uses_sqlite:
-            # SQLite serialises writers; a single shared connection keeps
-            # "database is locked" out of the hot path.
-            kwargs["poolclass"] = NullPool
+            # aiosqlite runs every statement on a worker thread, so a pooled
+            # connection is worth real time: measured 1.9ms/query against 6.1ms
+            # for NullPool, because NullPool re-opens the file and re-runs
+            # busy_timeout+PRAGMA setup on every checkout.
+            #
+            # SQLite still serialises *writers*, so the pool is deliberately
+            # small: five connections is enough to keep read traffic off the
+            # write lock, and max_overflow=0 stops a burst of commands from
+            # queueing on ``database is locked`` instead of waiting on the pool.
+            kwargs["poolclass"] = AsyncAdaptedQueuePool
+            kwargs["pool_size"] = self._settings.sqlite_pool_size
+            kwargs["max_overflow"] = 0
+            kwargs["pool_timeout"] = SQLITE_POOL_TIMEOUT
             kwargs["connect_args"] = {"timeout": int(self._settings.database_timeout)}
 
         engine = create_async_engine(self._settings.database_url, **kwargs)
@@ -202,15 +369,33 @@ class Database:
             self._initialized = True
 
     async def create_schema(self) -> None:
-        """Create any missing tables.
+        """Create missing tables, then add missing columns to existing ones.
 
-        Deliberately not a migration system: a fresh install gets a working
-        schema immediately, while existing deployments are expected to use
-        Alembic (see README).
+        ``create_all`` creates tables but never alters them, so a deployment that
+        predates a new column keeps the old shape and every ORM query naming that
+        column fails. This bot ships additive columns often enough that a real
+        migration framework is overkill, so the gaps are filled with
+        ``ADD COLUMN`` guarded by an inspection of the live table.
+
+        Rules this deliberately obeys:
+
+        *   **Additive only.** Nothing is dropped, renamed or retyped. There is no
+            ``down`` path because there is no destructive step to undo.
+        *   **Idempotent.** The column list comes from the live table on every
+            boot, so re-running is free and a partially applied migration heals.
+        *   **Nullable or defaulted.** A new column must never be ``NOT NULL``
+            without a server default, because adding it to a populated table
+            would otherwise fail on the existing rows.
         """
         engine = self._require_engine()
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            added = await connection.run_sync(
+                _add_missing_columns_sync, Base.metadata
+            )
+
+        if added:
+            logger.info("Schema migration | added columns: %s", ", ".join(added))
         logger.info(
             "Schema verified | tables=%s",
             ", ".join(sorted(Base.metadata.tables)),

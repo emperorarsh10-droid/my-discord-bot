@@ -87,7 +87,7 @@ redacted, or `/settings` for the per-server view.
 | `LOG_DIR` | `./logs` | |
 | `LOG_BUFFER` | `400` | Records kept in the ring `/status` reads. `DASHBOARD_LOG_BUFFER` is still accepted as an alias |
 | `DM_MEMBERS_ON_PUNISH` | `true` | Master switch; per-guild `/toggle-dm` overrides |
-| `MAX_PURGE_AMOUNT` | `100` | Hard cap for `/clear` |
+| `MAX_PURGE_AMOUNT` | `100` | Hard cap for `/purge` |
 | `CASE_PREFIX` | `ZEYE` | Prefix on case references |
 | `DEFAULT_MUTE_ROLE` | `Muted` | Name used by `/setup muted-role` |
 

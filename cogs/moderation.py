@@ -18,6 +18,7 @@ auditable:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 from collections.abc import Callable
@@ -678,10 +679,10 @@ class Moderation(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ------------------------------------------------------------------ #
-    # /clear
+    # /purge
     # ------------------------------------------------------------------ #
     @app_commands.command(
-        name="clear",
+        name="purge",
         description="Bulk-delete recent messages from this channel.",
     )
     @app_commands.guild_only
@@ -697,14 +698,14 @@ class Moderation(commands.Cog):
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         await self._guard(interaction, require=("manage_messages",))
-        PURGE_LIMIT.apply("clear", interaction.guild_id, interaction.user.id)
+        PURGE_LIMIT.apply("purge", interaction.guild_id, interaction.user.id)
 
         # The annotation above is baked at import time; re-check against the
         # live value so a mid-run config change can never widen the ceiling.
         ceiling = min(self.settings.max_purge_amount, MAX_PURGE_AMOUNT)
         if amount > ceiling:
             raise ZagrosError(
-                f"This server's ceiling is {ceiling} messages per `/clear` call."
+                f"This server's ceiling is {ceiling} messages per `/purge` call."
             )
 
         channel = interaction.channel
@@ -756,6 +757,33 @@ class Moderation(commands.Cog):
             deleted_total, interaction.guild_id, channel.id,
             interaction.user.id, case,
         )
+
+    # ------------------------------------------------------------------ #
+    # /clear — the previous name for /purge
+    # ------------------------------------------------------------------ #
+    @app_commands.command(
+        name="clear",
+        description="Bulk-delete recent messages (same as /purge).",
+    )
+    @app_commands.guild_only
+    @app_commands.describe(
+        amount="How many messages to delete, counting back from this one.",
+        reason="Why — recorded in the audit log.",
+    )
+    async def clear_alias(
+        self,
+        interaction: discord.Interaction,
+        amount: app_commands.Range[int, 2, MAX_PURGE_AMOUNT] = 10,
+        reason: app_commands.Range[str, 1, 512] | None = None,
+    ) -> None:
+        """Delegate to /purge.
+
+        Kept as a real second command because discord.py has no slash-command
+        alias: a guild with `/clear` muscle memory and saved commands gets a
+        silent "unknown command" otherwise. Both names share one implementation
+        so the two paths cannot drift apart.
+        """
+        await self.clear(interaction, amount, reason)
 
     # ------------------------------------------------------------------ #
     # /massban
@@ -1220,7 +1248,10 @@ class Moderation(commands.Cog):
     @_expiry_sweep.before_loop
     async def _before_sweep(self) -> None:
         # Without this the first run would iterate an empty guild list.
-        await self.bot.wait_until_ready()
+        # RuntimeError means the client was never logged in, which is how
+        # selftest.py loads extensions offline to inspect the command tree.
+        with contextlib.suppress(RuntimeError):
+            await self.bot.wait_until_ready()
         logger.info("Expiry sweeper armed (interval=5m)")
 
     @commands.Cog.listener()
