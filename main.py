@@ -36,7 +36,7 @@ from typing import Final
 import discord
 from discord.ext import commands
 
-from config import Settings, get_settings
+from config import ConfigurationError, Settings, get_settings
 from core.dashboard_state import (
     LATENCY_SAMPLE_SECONDS,
     BotStatus,
@@ -494,11 +494,18 @@ def main() -> int:
     for warning in warnings:
         logger.warning("Configuration: %s", warning)
 
-    if not settings.discord_bot_token.get_secret_value():
-        logger.critical(
-            "DISCORD_BOT_TOKEN is not set. Copy .env.example to .env and fill it in."
-        )
+    # Read through ``bot_token`` rather than the raw field: that property applies
+    # the DISCORD_BOT_TOKEN / DISCORD_TOKEN / BOT_TOKEN fallback and raises a
+    # ConfigurationError naming every accepted spelling. Checking the raw field
+    # here instead reported "not set" even when a fallback name carried a valid
+    # token, which is how a Railway deploy with DISCORD_TOKEN still refused to
+    # start.
+    try:
+        _resolved_token = settings.bot_token
+    except ConfigurationError as exc:
+        logger.critical("Discord bot token unavailable: %s", exc)
         return 4
+    logger.debug("Bot token resolved (%d chars)", len(_resolved_token))
 
     shutdown_event = threading.Event()
     _start_exit_watchdog(shutdown_event)
